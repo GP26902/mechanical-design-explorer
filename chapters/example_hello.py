@@ -32,7 +32,7 @@ def render() -> None:
     area = circle_area_m2(units.to_si(d, "length", system))   # raises ValidationError if invalid
     st.metric("Circle area", f"{area * 1e6:.1f} mm²")
     fig = go.Figure(go.Bar(x=["Area (mm²)"], y=[area * 1e6], marker_color=ACCENT))
-    st.plotly_chart(apply_theme(fig, "Area for the chosen diameter", 300), use_container_width=True)
+    st.plotly_chart(apply_theme(fig, "Area for the chosen diameter", 300), width="stretch")
 
 
 if __name__ == "__main__":

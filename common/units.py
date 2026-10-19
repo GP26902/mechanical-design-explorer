@@ -48,4 +48,6 @@ def from_si(value_si: float, kind: str, system: str) -> float:
 
 def fmt(value_si: float, kind: str, system: str, digits: int = 3) -> str:
     """Format an SI value for display in the user's units, e.g. '25.4 mm' or '1 in'."""
-    return f"{from_si(value_si, kind, system):.{digits}g} {label(kind, system)}"
+    x = from_si(value_si, kind, system)
+    text = f"{x:,.0f}" if abs(x) >= 10**digits else f"{x:.{digits}g}"   # avoid '5e+03'
+    return f"{text} {label(kind, system)}"

@@ -29,6 +29,8 @@ def test_round_trip(kind, system):
 def test_labels_and_format():
     assert units.label("stress", "US") == "ksi"
     assert units.fmt(0.0254, "length", "US") == "1 in"
+    assert units.fmt(5000, "force", "SI") == "5,000 N"       # no scientific notation
+    assert units.fmt(156.25e6, "stress", "SI") == "156 MPa"
 
 
 def test_unknown_kind_or_system_gives_clear_error():
