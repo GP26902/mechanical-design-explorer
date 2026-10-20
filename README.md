@@ -8,8 +8,6 @@ Interactive engineering tools for the questions mechanical, quality and manufact
 
 ## What it does
 
-Three chapters in one app, each switchable between SI and US units. Every input is validated, and impossible values (zero diameter, negative span, a minimum size above the maximum, and so on) give a clear message instead of a crash.
-
 ### 1. Beam & shaft stress
 *Question: does this part carry the load with enough margin?*
 
@@ -53,8 +51,6 @@ Three chapters in one app, each switchable between SI and US units. Every input 
 | Tolerance stack-up & GD&T | 53 + 5 app | Worst-case, RSS (√Σt²) and Cpk against hand values for a worked stack; asymmetric tolerances; contribution shares; Monte Carlo against the analytic mean, σ and normal-tail fraction (statistical checks with fixed seed); hole and pin bonus tolerance, zone and virtual condition; RFS; boundary and out-of-size cases; invalid rows, spec limits and sample counts |
 | Pump & pipe | 49 + 6 app | Laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; an independent hand calculation of the system head; affinity laws; analytic operating point; NPSH available and cavitation thresholds; water vapour pressure; energy balance along the layout; trends with speed, temperature and pipe size; weak pump (no operating point); transitional flow flag; invalid layouts, pumps and speeds |
 | Shared code | 40 | Unit conversions and round trips (20), validation helpers (11), chapter auto-discovery (5), app smoke tests (4) |
-
-The app tests use Streamlit's AppTest to load each chapter, change inputs, switch units and confirm that bad inputs show a message. **Not covered:** testing in a real browser, and cell-by-cell editing of the tolerance table (the table-to-calculation conversion is unit-tested).
 
 ## Limitations
 
