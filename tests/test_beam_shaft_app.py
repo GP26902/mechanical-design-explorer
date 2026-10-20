@@ -46,7 +46,7 @@ def test_overload_fails():
 def test_shell_lists_both_chapters():
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
     assert not at.exception
-    assert len(at.sidebar.selectbox[0].options) == 2
+    assert len(at.sidebar.selectbox[0].options) == 3
     at.sidebar.selectbox[0].select_index(1) if "Beam" not in at.title[0].value else None
     at.run()
     assert not at.exception
