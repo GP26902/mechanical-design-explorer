@@ -29,9 +29,9 @@ TITLE = "1 · Beam & shaft stress"
 KEY_PREFIX = "bs_"
 ABOUT = """**Method.** A small 1D Euler-Bernoulli beam finite-element model (a cross-check-grade tool, not general FEA) gives reactions and deflection for five support cases under a point load and/or a full-length uniform load. Shear and moment follow from equilibrium. For simply supported and cantilever beams the maximum deflection is shown from closed-form equations and the finite-element result is the cross-check. Shaft mode adds torsion (τ = Tc/J) and a von Mises equivalent stress. The optional fatigue check uses the Goodman relation.
 
-**Checked in pytest:** reactions, shear and moment (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12) and centre deflections; propped cantilever reactions and wall moment; overhanging beam reactions, support moment and tip deflection; force and moment equilibrium for every support and load case; section properties; torsion; von Mises; endurance limit and Goodman.
+**Checked in pytest:** reactions, shear and moment (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12) and centre deflections; propped cantilever reactions and wall moment; overhanging beam reactions, support moment and tip deflection; force and moment equilibrium for every support and load case; section properties (rectangle, round, tube, rectangular tube, I-beam); torsion; von Mises; custom material and deflection limit checks; endurance limit and Goodman.
 
-**Limitations:** linear elastic, one point load and/or a full-length uniform load, self-weight ignored. Transverse shear, stress concentrations, buckling and contact stresses are not included.
+**Limitations:** linear elastic, one point load and/or a full-length uniform load, self-weight ignored. Transverse shear, web crippling, local buckling of thin walls, stress concentrations and contact stresses are not included. Rectangular tubes and I-beams are bending only (no torsion).
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Five support cases under point and uniform loads using a small 1D finite-element model checked against "
@@ -52,7 +52,11 @@ SUPPORT_LABELS = {SS: "Simply supported", CANT: "Cantilever (fixed at left end)"
                   OVER: "Overhanging (overhang at right)"}
 LOAD_TYPES = ["Point load", "Uniform load (UDL)", "Point + uniform"]
 SHAPE_LABELS = {"rectangle": "Rectangle (b × h)", "solid_round": "Solid round (d)",
-                "hollow_round": "Hollow round / tube (Do, Di)"}
+                "hollow_round": "Hollow round / tube (Do, Di)",
+                "hollow_rect": "Hollow rectangular tube (b, h, t)",
+                "i_beam": "I-beam (bf, tf, h, tw)"}
+CUSTOM_MATERIAL = "Custom (enter E, yield, ultimate)"
+DEFL_LIMITS = {"Off": None, "L/180": 180, "L/250": 250, "L/360": 360, "L/500": 500}
 
 
 @dataclass(frozen=True)
@@ -86,7 +90,8 @@ class SectionProps:
 
 
 def section_properties(shape: str, **dims: float) -> SectionProps:
-    """Rectangle: b, h. Solid round: d. Hollow round: d_o, d_i."""
+    """Rectangle: b, h. Solid round: d. Hollow round: d_o, d_i. Hollow rectangular tube: b, h, t (wall).
+    I-beam (bending about the strong axis): bf, tf, h, tw."""
     if shape == "rectangle":
         b = require_positive(dims.get("b"), "Width b")
         h = require_positive(dims.get("h"), "Depth h")
@@ -100,6 +105,23 @@ def section_properties(shape: str, **dims: float) -> SectionProps:
         require_less_than(di, "Inner diameter", do, "outer diameter")
         return SectionProps(shape, np.pi * (do**2 - di**2) / 4, np.pi * (do**4 - di**4) / 64,
                             np.pi * (do**4 - di**4) / 32, do / 2, do, di)
+    if shape == "hollow_rect":
+        b = require_positive(dims.get("b"), "Width b")
+        h = require_positive(dims.get("h"), "Depth h")
+        t = require_positive(dims.get("t"), "Wall thickness t")
+        require_less_than(2 * t, "Twice the wall thickness", min(b, h), "the smaller outer dimension")
+        inner = (b - 2 * t) * (h - 2 * t)
+        return SectionProps(shape, b * h - inner, (b * h**3 - (b - 2 * t) * (h - 2 * t)**3) / 12, None, h / 2, h,
+                            h - 2 * t)
+    if shape == "i_beam":
+        bf = require_positive(dims.get("bf"), "Flange width")
+        tf = require_positive(dims.get("tf"), "Flange thickness")
+        h = require_positive(dims.get("h"), "Total depth")
+        tw = require_positive(dims.get("tw"), "Web thickness")
+        require_less_than(2 * tf, "Twice the flange thickness", h, "the total depth")
+        require_less_than(tw, "Web thickness", bf, "flange width")
+        hw = h - 2 * tf
+        return SectionProps(shape, bf * h - (bf - tw) * hw, (bf * h**3 - (bf - tw) * hw**3) / 12, None, h / 2, h, 0.0)
     raise ValidationError(f"Unknown cross-section '{shape}'.")
 
 
@@ -334,10 +356,28 @@ class Result:
     n_req: float
     passed: bool
     w_closed: Optional[float] = None    # closed-form maximum deflection (None: finite element only)
+    strength_ok: bool = True            # safety factor (and fatigue factor if checked) meets the requirement
+    defl_ratio: Optional[float] = None  # deflection limit as span / ratio (None: not checked)
+    defl_items: tuple = ()              # ((label, actual, allowed), ...) in metres
+    defl_ok: bool = True
+
+
+def deflection_limit_items(support, L, overhang, sol: BeamSolution, w_max, ratio) -> tuple:
+    """Serviceability check items (label, actual, allowed), in metres. Between supports the allowed deflection
+    is span / ratio; the overhang tip is checked against 2 x overhang / ratio; a cantilever uses its length
+    (the conservative choice; some codes use twice the length)."""
+    require_positive(ratio, "Deflection limit ratio")
+    if support == OVER:
+        span = L - overhang
+        in_span = sol.nodes <= span + 1e-9 * L
+        return (("Span deflection", float(np.max(np.abs(sol.w[in_span]))), span / ratio),
+                ("Overhang tip deflection", float(abs(sol.w[-1])), 2 * overhang / ratio))
+    return (("Tip deflection" if support == CANT else "Max deflection", float(w_max), L / ratio),)
 
 
 def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
-            fatigue_R: Optional[float] = None, fatigue_k: float = 0.6, *, w=0.0, overhang=0.0) -> Result:
+            fatigue_R: Optional[float] = None, fatigue_k: float = 0.6, *, w=0.0, overhang=0.0,
+            defl_ratio: Optional[float] = None) -> Result:
     """P: point load (N) at a (m from the left end); w: full-length uniform load (N/m);
     overhang: length of the overhang (m) for the overhanging beam."""
     _check_load_case(support, L, P, a, w, overhang)
@@ -345,6 +385,8 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
     require_positive(n_req, "Required safety factor")
     for name, v in (("E", material.E), ("Yield strength", material.Sy), ("Ultimate strength", material.Su)):
         require_positive(v, name)
+    if material.Su < material.Sy:
+        raise ValidationError("Ultimate strength must be at least the yield strength.")
     sec = section_properties(shape, **dims)
     if T > 0 and sec.J is None:
         raise ValidationError("Torque needs a round section (solid or hollow). Rectangles are not modelled for torsion.")
@@ -376,10 +418,13 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
 
     w_fe_max = float(np.max(np.abs(sol.w)))
     w_cf = closed_form_max_deflection(support, L, P, a, w, material.E, sec.I)
-    passed = sf >= n_req and (sf_f is None or sf_f >= n_req)
+    strength_ok = sf >= n_req and (sf_f is None or sf_f >= n_req)
+    w_show = w_cf if w_cf is not None else w_fe_max
+    items = deflection_limit_items(support, L, overhang, sol, w_show, defl_ratio) if defl_ratio else ()
+    defl_ok = all(actual <= allowed for _, actual, allowed in items)
     return Result(x, V, M, sol.nodes, sol.w, vm_x, sec, T, reaction_summary(support, sol), sigma_max,
-                  float(tau), vm_max, w_cf if w_cf is not None else w_fe_max, w_fe_max, sf, sf_f, n_req,
-                  passed, w_cf)
+                  float(tau), vm_max, w_show, w_fe_max, sf, sf_f, n_req, strength_ok and defl_ok, w_cf,
+                  strength_ok, defl_ratio, items, defl_ok)
 
 
 # =============================================================================================
@@ -478,6 +523,13 @@ def _size(label, default_si, key, system):
     return units.to_si(v, "length", system)
 
 
+def _stress_input(label, default_si, key, system):
+    d = units.from_si(default_si, "stress", system)
+    v = st.number_input(f"{label} ({units.label('stress', system)})", value=float(d), step=float(d / 20),
+                        format="%.1f", key=f"{key}_{system}")
+    return units.to_si(v, "stress", system)
+
+
 def render() -> None:
     system = get_unit_system()
     left, right = st.columns([1, 2], gap="large")
@@ -500,32 +552,61 @@ def render() -> None:
             dims = {"b": _size("Width b", 0.030, "bs_b", system), "h": _size("Depth h", 0.040, "bs_h", system)}
         elif shape == "solid_round":
             dims = {"d": _size("Diameter d", 0.040, "bs_d", system)}
-        else:
+        elif shape == "hollow_round":
             dims = {"d_o": _size("Outer diameter", 0.050, "bs_do", system),
                     "d_i": _size("Inner diameter", 0.040, "bs_di", system)}
+        elif shape == "hollow_rect":
+            dims = {"b": _size("Width b", 0.040, "bs_rb", system), "h": _size("Depth h", 0.060, "bs_rh", system),
+                    "t": _size("Wall thickness t", 0.004, "bs_rt", system)}
+        else:
+            dims = {"bf": _size("Flange width", 0.100, "bs_ibf", system),
+                    "tf": _size("Flange thickness", 0.008, "bs_itf", system),
+                    "h": _size("Total depth h", 0.200, "bs_ih", system),
+                    "tw": _size("Web thickness", 0.006, "bs_itw", system)}
         T = _slider("Torque", "torque", 0.0, 1000.0, 150.0, "bs_T", system) if shaft else 0.0
-        mat_name = st.selectbox("Material (typical values, illustrative)", list(MATERIALS), key="bs_material")
-        material = MATERIALS[mat_name]
-        st.caption(f"E = {units.fmt(material.E, 'stress', system, 4)}, yield = {units.fmt(material.Sy, 'stress', system)}, "
-                   f"ultimate = {units.fmt(material.Su, 'stress', system)}")
+        mat_name = st.selectbox("Material (typical values, illustrative)", [*MATERIALS, CUSTOM_MATERIAL],
+                                key="bs_material")
+        if mat_name == CUSTOM_MATERIAL:
+            base = MATERIALS["Steel AISI 1018 (cold drawn)"]
+            material = Material("Custom", _stress_input("Elastic modulus E", base.E, "bs_cE", system),
+                                _stress_input("Yield strength", base.Sy, "bs_cSy", system),
+                                _stress_input("Ultimate strength", base.Su, "bs_cSu", system))
+            st.caption("Custom values are whatever you enter; check them against your material certificate.")
+        else:
+            material = MATERIALS[mat_name]
+            st.caption(f"E = {units.fmt(material.E, 'stress', system, 4)}, yield = {units.fmt(material.Sy, 'stress', system)}, "
+                       f"ultimate = {units.fmt(material.Su, 'stress', system)}")
         n_req = st.slider("Required safety factor", 1.0, 4.0, 1.5, 0.1, key="bs_nreq")
+        defl_label = st.selectbox("Deflection limit (span ÷ ratio)", list(DEFL_LIMITS), key="bs_defl")
         fatigue = st.checkbox("Fatigue check (Goodman)", key="bs_fatigue")
         R = k = None
         if fatigue:
             R = st.slider("Load ratio R = P_min / P_max (−1 = fully reversed)", -1.0, 1.0, 0.0, 0.1, key="bs_R")
             k = st.slider("Fatigue reduction factor k (surface, size, reliability)", 0.2, 1.0, 0.6, 0.05, key="bs_k")
 
-    res = analyse(support, L, P, a, shape, dims, material, T, n_req, R, k if k else 0.6, w=w, overhang=overhang)
+    res = analyse(support, L, P, a, shape, dims, material, T, n_req, R, k if k else 0.6, w=w, overhang=overhang,
+                  defl_ratio=DEFL_LIMITS[defl_label])
 
     with right:
         if L / res.section.depth < 5:
             st.warning("Span is under 5× the section depth: beam theory is unreliable for such short, deep members.")
+        gov = max(res.defl_items, key=lambda it: it[1] / it[2]) if res.defl_items else None
+        fmt_len = lambda v: units.fmt(v, "length", system)
         if res.passed:
-            st.success(f"PASS: safety factor {res.sf:.2f} ≥ required {n_req:.1f}" if np.isfinite(res.sf)
-                       else "PASS: no load applied")
+            msg = (f"PASS: safety factor {res.sf:.2f} ≥ required {n_req:.1f}" if np.isfinite(res.sf)
+                   else "PASS: no load applied")
+            if gov:
+                msg += f"; {gov[0].lower()} {fmt_len(gov[1])} ≤ allowed {fmt_len(gov[2])} ({defl_label})"
+            st.success(msg)
         else:
-            st.error(f"FAIL: safety factor below the required {n_req:.1f}"
-                     + (" (yielding predicted)" if res.sf < 1 else ""))
+            parts = []
+            if not res.strength_ok:
+                parts.append(f"FAIL: safety factor below the required {n_req:.1f}"
+                             + (" (yielding predicted)" if res.sf < 1 else ""))
+            for label, actual, allowed in res.defl_items:
+                if actual > allowed:
+                    parts.append(f"FAIL: {label.lower()} {fmt_len(actual)} exceeds the allowed {fmt_len(allowed)} ({defl_label})")
+            st.error(" · ".join(parts))
         c1, c2 = st.columns(2)
         c1.metric("Max von Mises stress", units.fmt(res.vm_max, "stress", system))
         c2.metric("Safety factor (yield)", "∞" if not np.isfinite(res.sf) else f"{res.sf:.2f}")
@@ -553,7 +634,10 @@ def render() -> None:
                 "- Linear-elastic Euler-Bernoulli beam; one point load and/or a full-length uniform load; self-weight ignored.\n"
                 "- Stress at the outer fibre of the critical section: σ = M·c/I; torsion τ = T·c/J; "
                 "von Mises σ<sub>vm</sub> = √(σ² + 3τ²). Safety factor = yield / σ<sub>vm</sub>.\n"
-                "- Transverse shear, stress concentrations, buckling and contact stresses are **not** included.\n"
+                "- Optional deflection limit: span ÷ ratio between supports, 2 × overhang ÷ ratio at an overhang tip, and the "
+                "length for a cantilever (conservative).\n"
+                "- Transverse shear, web crippling, local buckling of thin walls, stress concentrations and contact stresses are "
+                "**not** included.\n"
                 "- Goodman: n = 1/(σ<sub>a</sub>/S<sub>e</sub> + σ<sub>m</sub>/S<sub>u</sub>), with simplified "
                 "S<sub>e</sub> = k·0.5·S<sub>u</sub> (cap 700 MPa); the same load ratio R is applied to bending and torque.\n"
                 "- The 1D finite-element model is not a general FEA tool.", unsafe_allow_html=True)
