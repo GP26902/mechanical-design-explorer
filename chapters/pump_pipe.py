@@ -23,11 +23,19 @@ from plotly.colors import sample_colorscale
 
 from common import units
 from common.theme import ACCENT, FAIL_COLOR, PASS_COLOR, STRESS_COLORSCALE, apply_theme
-from common.ui import get_unit_system, run_standalone
+from common.ui import get_unit_system, run_standalone, slider_box
 from common.validation import (ValidationError, require_in_range, require_less_than, require_non_negative,
                                require_positive)
 
 TITLE = "2 · Pump & pipe system"
+KEY_PREFIX = "pp_"
+ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction with a laminar or Colebrook-White friction factor, fitting losses from loss coefficients, and a quadratic pump curve scaled with the affinity laws. The operating point is where the pump curve meets the system curve. Cavitation risk compares NPSH available with NPSH required.
+
+**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance.
+
+**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. Pump efficiency and power, water hammer, two-phase flow and parallel branches are not modelled.
+
+For learning and screening, not certified design."""
 DESCRIPTION = ("Darcy-Weisbach pipe and fitting losses against a centrifugal pump curve: operating point, "
                "bottleneck section and NPSH cavitation check (system-curve analysis, not CFD).")
 
@@ -523,10 +531,9 @@ def npsh_figure(r: Result, system: str) -> go.Figure:
 # =============================================================================================
 # UI
 # =============================================================================================
-def _slider(label, kind, lo, hi, default, key, system, fmt=None):
+def _slider(label, kind, lo, hi, default, key, system):
     lo_u, hi_u, d_u = (units.from_si(v, kind, system) for v in (lo, hi, default))
-    v = st.slider(f"{label} ({units.label(kind, system)})", float(lo_u), float(hi_u), float(d_u),
-                  step=float((hi_u - lo_u) / 200), format=fmt, key=f"{key}_{system}")
+    v = slider_box(f"{label} ({units.label(kind, system)})", lo_u, hi_u, d_u, f"{key}_{system}")
     return units.to_si(v, kind, system)
 
 
@@ -544,12 +551,12 @@ def render() -> None:
     with left:
         st.subheader("System")
         mat = st.selectbox("Pipe material (roughness)", list(ROUGHNESS), key="pp_material")
-        d_s = _slider("Suction pipe diameter", "length", 0.040, 0.250, 0.125, "pp_ds", system, "%.1f" if system == units.SI else "%.2f")
-        l_s = _slider("Suction pipe length", "length_long", 0.5, 20.0, 3.0, "pp_ls", system, "%.1f")
-        z_s = _slider("Suction tank level above pump (− = lift)", "length_long", -6.0, 6.0, 1.0, "pp_zs", system, "%.1f")
-        d_d = _slider("Discharge pipe diameter", "length", 0.040, 0.250, 0.100, "pp_dd", system, "%.1f" if system == units.SI else "%.2f")
-        l_d = _slider("Discharge pipe length", "length_long", 5.0, 300.0, 60.0, "pp_ld", system, "%.0f")
-        z_d = _slider("Discharge tank level above pump", "length_long", 0.0, 40.0, 12.0, "pp_zd", system, "%.1f")
+        d_s = _slider("Suction pipe diameter", "length", 0.040, 0.250, 0.125, "pp_ds", system)
+        l_s = _slider("Suction pipe length", "length_long", 0.5, 20.0, 3.0, "pp_ls", system)
+        z_s = _slider("Suction tank level above pump (− = lift)", "length_long", -6.0, 6.0, 1.0, "pp_zs", system)
+        d_d = _slider("Discharge pipe diameter", "length", 0.040, 0.250, 0.100, "pp_dd", system)
+        l_d = _slider("Discharge pipe length", "length_long", 5.0, 300.0, 60.0, "pp_ld", system)
+        z_d = _slider("Discharge tank level above pump", "length_long", 0.0, 40.0, 12.0, "pp_zd", system)
         n_b = st.slider("90° bends on the discharge side", 0, 12, 4, key="pp_bends")
         vt, vn = st.columns([2, 1])
         valve = vt.selectbox("Valve type", list(VALVE_K), key="pp_valve")
@@ -624,4 +631,4 @@ def render() -> None:
 
 
 if __name__ == "__main__":
-    run_standalone(TITLE, DESCRIPTION, render)
+    run_standalone(TITLE, DESCRIPTION, render, KEY_PREFIX, ABOUT)

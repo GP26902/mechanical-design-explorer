@@ -17,6 +17,8 @@ from common.validation import require_positive
 
 TITLE = "Template chapter"
 DESCRIPTION = "One sentence on what this chapter shows and the method it uses."
+KEY_PREFIX = "tpl_"   # optional: prefix of this chapter's widget keys; the sidebar Reset button clears them
+ABOUT = ""            # optional: markdown (method, checks, limitations) shown in the sidebar expander
 
 
 # ---- Calculations: pure functions, SI in / SI out, no Streamlit ----------------------------
@@ -34,4 +36,4 @@ def render() -> None:
 
 
 if __name__ == "__main__":
-    run_standalone(TITLE, DESCRIPTION, render)
+    run_standalone(TITLE, DESCRIPTION, render, KEY_PREFIX, ABOUT)

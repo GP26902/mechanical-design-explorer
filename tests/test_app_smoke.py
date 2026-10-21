@@ -14,7 +14,7 @@ def test_shell_loads_with_chapter_and_disclaimer():
 
 def test_invalid_input_shows_message_not_crash():
     at = AppTest.from_file(str(ROOT / "app.py"), default_timeout=30).run()
-    at.number_input[0].set_value(0).run()
+    at.number_input(key="bs_b_SI").set_value(0).run()
     assert not at.exception
     assert any("greater than zero" in e.value for e in at.error)
 

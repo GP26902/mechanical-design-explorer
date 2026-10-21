@@ -8,7 +8,7 @@ from pathlib import Path
 import streamlit as st
 
 from common.discovery import discover_chapters
-from common.ui import render_safely, show_disclaimer, unit_selector
+from common.ui import chapter_sidebar, render_safely, show_disclaimer, sidebar_links, unit_selector
 
 CHAPTERS_DIR = Path(__file__).parent / "chapters"
 
@@ -26,6 +26,7 @@ if not loaded:
 else:
     choice = st.sidebar.selectbox("Chapter", loaded, format_func=lambda c: c.title)
     unit_selector()
+    chapter_sidebar(choice.key_prefix, choice.about)
     st.title(choice.title)
     st.caption(choice.description)
     show_disclaimer()
@@ -33,3 +34,5 @@ else:
 
 for c in broken:
     st.sidebar.error(c.error)
+
+sidebar_links()

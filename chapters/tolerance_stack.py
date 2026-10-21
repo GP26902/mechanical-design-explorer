@@ -21,10 +21,18 @@ import streamlit as st
 
 from common import units
 from common.theme import ACCENT, FAIL_COLOR, PASS_COLOR, apply_theme
-from common.ui import get_unit_system, run_standalone
+from common.ui import get_unit_system, run_standalone, slider_box
 from common.validation import ValidationError, require_in_range, require_non_negative, require_positive
 
 TITLE = "3 · Tolerance stack-up & GD&T"
+KEY_PREFIX = "ts_"
+ABOUT = """**Method.** One-dimensional tolerance stacks compared three ways: worst-case, RSS (√Σt²) and Monte Carlo. Each tolerance band is treated as ±kσ of a normal distribution (k selectable). Cpk, percent out of spec and each dimension's contribution are shown. The GD&T tab draws a position tolerance zone with bonus tolerance at MMC and compares it with RFS. It is a learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.
+
+**Checked in pytest:** worst-case, RSS and Cpk against hand values; asymmetric tolerances; contribution shares; Monte Carlo against the analytic mean, σ and tail fraction (fixed seed); bonus tolerance, zone and virtual condition; RFS; boundary cases.
+
+**Limitations:** 1D linear stacks, no process drift, correlation or non-normal distributions. GD&T covers one feature with one position zone (no datum frames, composite or projected zones, orientation or form controls, LMC).
+
+For learning and screening, not certified design."""
 DESCRIPTION = ("Worst-case, RSS and Monte Carlo stack-ups with Cpk and contribution ranking, plus a "
                "GD&T position tolerance zone with bonus tolerance at MMC (learning tool, ASME Y14.5 concepts).")
 
@@ -435,9 +443,7 @@ def _len_input(label, default_si, key, system):
 
 def _len_slider(label, lo, hi, default, key, system):
     lo_u, hi_u, d_u = (_L(v, system) for v in (lo, hi, default))
-    v = st.slider(f"{label} ({units.label('length', system)})", float(lo_u), float(hi_u), float(d_u),
-                  step=float((hi_u - lo_u) / 240), format="%.3f" if system == units.SI else "%.5f",
-                  key=f"{key}_{system}")
+    v = slider_box(f"{label} ({units.label('length', system)})", lo_u, hi_u, d_u, f"{key}_{system}")
     return units.to_si(v, "length", system)
 
 
@@ -572,4 +578,4 @@ def render() -> None:
 
 
 if __name__ == "__main__":
-    run_standalone(TITLE, DESCRIPTION, render)
+    run_standalone(TITLE, DESCRIPTION, render, KEY_PREFIX, ABOUT)

@@ -20,11 +20,19 @@ from plotly.subplots import make_subplots
 
 from common import units
 from common.theme import ACCENT, STRESS_COLORSCALE, apply_theme
-from common.ui import get_unit_system, run_standalone
+from common.ui import get_unit_system, run_standalone, slider_box
 from common.validation import (ValidationError, require_in_range, require_less_than,
                                require_non_negative, require_positive)
 
 TITLE = "1 · Beam & shaft stress"
+KEY_PREFIX = "bs_"
+ABOUT = """**Method.** Closed-form Euler-Bernoulli beam equations for reactions, shear, moment and deflection, cross-checked against a small 1D beam finite-element model (a cross-check, not a general FEA tool). Shaft mode adds torsion (τ = Tc/J) and a von Mises equivalent stress. The optional fatigue check uses the Goodman relation.
+
+**Checked in pytest:** reactions, shear and moment (PL/4); deflection against PL³/48EI and PL³/3EI; finite-element model against the closed form; section properties; torsion; von Mises; endurance limit and Goodman; combined bending and torsion by hand.
+
+**Limitations:** linear elastic, one point load, self-weight ignored. Transverse shear, stress concentrations, buckling and contact stresses are not included.
+
+For learning and screening, not certified design."""
 DESCRIPTION = ("Closed-form beam equations plus a small 1D finite-element model: stress map, "
                "deformed shape, shear and moment diagrams, safety factor and optional Goodman fatigue check.")
 
@@ -321,8 +329,7 @@ def diagram_figure(res: Result, system) -> go.Figure:
 # =============================================================================================
 def _slider(label, kind, lo, hi, default, key, system):
     lo_u, hi_u, d_u = (units.from_si(v, kind, system) for v in (lo, hi, default))
-    v = st.slider(f"{label} ({units.label(kind, system)})", float(lo_u), float(hi_u), float(d_u),
-                  step=float((hi_u - lo_u) / 200), key=f"{key}_{system}")
+    v = slider_box(f"{label} ({units.label(kind, system)})", lo_u, hi_u, d_u, f"{key}_{system}")
     return units.to_si(v, kind, system)
 
 
@@ -407,4 +414,4 @@ def render() -> None:
 
 
 if __name__ == "__main__":
-    run_standalone(TITLE, DESCRIPTION, render)
+    run_standalone(TITLE, DESCRIPTION, render, KEY_PREFIX, ABOUT)

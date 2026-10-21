@@ -1,7 +1,7 @@
 """Chapter auto-discovery. Pure module (no Streamlit) so it can be unit tested.
 
 A chapter is any chapters/<name>.py (not starting with '_') that defines TITLE, DESCRIPTION
-and a callable render(). Broken chapters are reported, never fatal.
+and a callable render(). It may also define KEY_PREFIX and ABOUT (both optional). Broken chapters are reported, never fatal.
 """
 from __future__ import annotations
 
@@ -22,6 +22,8 @@ class Chapter:
     description: str
     render: Optional[Callable[[], None]]
     error: Optional[str] = None            # set when the chapter could not be loaded
+    key_prefix: str = ""                   # optional KEY_PREFIX: session keys the Reset button clears
+    about: str = ""                        # optional ABOUT: markdown shown in the sidebar expander
 
     @property
     def ok(self) -> bool:
@@ -58,4 +60,5 @@ def _load(path: Path) -> Chapter:
         problem = ", ".join(missing) if missing else "render (not callable)"
         return Chapter(name, name, "", None, error=f"{path.name} is missing: {problem}")
 
-    return Chapter(name, str(module.TITLE), str(module.DESCRIPTION), module.render)
+    return Chapter(name, str(module.TITLE), str(module.DESCRIPTION), module.render, None,
+                   str(getattr(module, "KEY_PREFIX", "")), str(getattr(module, "ABOUT", "")))
