@@ -1,8 +1,9 @@
 """Chapter 1: Beam & shaft stress.
 
-Methods (no FEA/CFD claims): closed-form Euler-Bernoulli beam equations for reactions, shear,
-moment, stress and deflection, plus a small 1D Euler-Bernoulli beam finite-element model that
-draws the deformed shape and is cross-checked against the closed form in the tests.
+Methods (no FEA/CFD claims): a small 1D Euler-Bernoulli beam finite-element model gives the
+reactions and deflection for every support case (simply supported, cantilever, fixed-fixed, propped
+cantilever, overhanging) under a point load and/or a full-length uniform load; shear and moment follow
+from equilibrium. Closed-form beam equations are kept as independent references and checked against it in the tests.
 Shaft mode adds torsion (tau = T*c/J) and von Mises combination.
 """
 import sys
@@ -26,22 +27,30 @@ from common.validation import (ValidationError, require_in_range, require_less_t
 
 TITLE = "1 · Beam & shaft stress"
 KEY_PREFIX = "bs_"
-ABOUT = """**Method.** Closed-form Euler-Bernoulli beam equations for reactions, shear, moment and deflection, cross-checked against a small 1D beam finite-element model (a cross-check, not a general FEA tool). Shaft mode adds torsion (τ = Tc/J) and a von Mises equivalent stress. The optional fatigue check uses the Goodman relation.
+ABOUT = """**Method.** A small 1D Euler-Bernoulli beam finite-element model (a cross-check-grade tool, not general FEA) gives reactions and deflection for five support cases under a point load and/or a full-length uniform load. Shear and moment follow from equilibrium. For simply supported and cantilever beams the maximum deflection is shown from closed-form equations and the finite-element result is the cross-check. Shaft mode adds torsion (τ = Tc/J) and a von Mises equivalent stress. The optional fatigue check uses the Goodman relation.
 
-**Checked in pytest:** reactions, shear and moment (PL/4); deflection against PL³/48EI and PL³/3EI; finite-element model against the closed form; section properties; torsion; von Mises; endurance limit and Goodman; combined bending and torsion by hand.
+**Checked in pytest:** reactions, shear and moment (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12) and centre deflections; propped cantilever reactions and wall moment; overhanging beam reactions, support moment and tip deflection; force and moment equilibrium for every support and load case; section properties; torsion; von Mises; endurance limit and Goodman.
 
-**Limitations:** linear elastic, one point load, self-weight ignored. Transverse shear, stress concentrations, buckling and contact stresses are not included.
+**Limitations:** linear elastic, one point load and/or a full-length uniform load, self-weight ignored. Transverse shear, stress concentrations, buckling and contact stresses are not included.
 
 For learning and screening, not certified design."""
-DESCRIPTION = ("Closed-form beam equations plus a small 1D finite-element model: stress map, "
-               "deformed shape, shear and moment diagrams, safety factor and optional Goodman fatigue check.")
+DESCRIPTION = ("Five support cases under point and uniform loads using a small 1D finite-element model checked against "
+               "textbook equations: stress map, deformed shape, shear and moment diagrams, safety factor and optional Goodman fatigue check.")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
 # =============================================================================================
 SS = "simply_supported"
 CANT = "cantilever"
-SUPPORT_LABELS = {SS: "Simply supported", CANT: "Cantilever (fixed at left end)"}
+FIXED = "fixed_fixed"
+PROPPED = "propped_cantilever"
+OVER = "overhanging"
+SUPPORTS = (SS, CANT, FIXED, PROPPED, OVER)
+SUPPORT_LABELS = {SS: "Simply supported", CANT: "Cantilever (fixed at left end)",
+                  FIXED: "Fixed at both ends",
+                  PROPPED: "Propped cantilever (fixed left, pinned right)",
+                  OVER: "Overhanging (overhang at right)"}
+LOAD_TYPES = ["Point load", "Uniform load (UDL)", "Point + uniform"]
 SHAPE_LABELS = {"rectangle": "Rectangle (b × h)", "solid_round": "Solid round (d)",
                 "hollow_round": "Hollow round / tube (Do, Di)"}
 
@@ -94,12 +103,16 @@ def section_properties(shape: str, **dims: float) -> SectionProps:
     raise ValidationError(f"Unknown cross-section '{shape}'.")
 
 
-def _check_load_case(support, L, P, a):
-    if support not in (SS, CANT):
+def _check_load_case(support, L, P, a, w=0.0, overhang=0.0):
+    if support not in SUPPORTS:
         raise ValidationError(f"Unknown support type '{support}'.")
     require_positive(L, "Span")
     require_non_negative(P, "Load")
+    require_non_negative(w, "Distributed load")
     require_in_range(a, "Load position", 0.0, L)
+    if support == OVER:
+        require_positive(overhang, "Overhang")
+        require_less_than(overhang, "Overhang", L, "beam length")
 
 
 def reactions(support: str, L: float, P: float, a: float) -> dict:
@@ -152,29 +165,128 @@ def max_deflection(support, L, P, a, E, I) -> float:
     return P * a**2 * (3 * L - a) / (6 * E * I)    # tip deflection
 
 
-def fe_deflection(support, L, P, a, E, I, n_el: int = 80):
+def deflection_udl_closed_form(support, L, w, E, I, x):
+    """Deflection (downward positive) under a full-length uniform load w (N/m): textbook equations."""
+    x = np.asarray(x, dtype=float)
+    if support == SS:
+        return w * x * (L**3 - 2 * L * x**2 + x**3) / (24 * E * I)
+    if support == CANT:
+        return w * x**2 * (6 * L**2 - 4 * L * x + x**2) / (24 * E * I)
+    raise ValidationError("Closed-form UDL deflection is only provided for simply supported and cantilever beams.")
+
+
+def closed_form_max_deflection(support, L, P, a, w, E, I) -> Optional[float]:
+    """Largest deflection from closed-form equations (superposition of point load and UDL), or None
+    for supports where the chapter uses the finite-element result instead."""
+    if support not in (SS, CANT):
+        return None
+    if w == 0:
+        return float(max_deflection(support, L, P, a, E, I))
+    if P == 0:
+        return float(5 * w * L**4 / (384 * E * I) if support == SS else w * L**4 / (8 * E * I))
+    x = np.linspace(0.0, L, 4001)
+    return float((deflection_closed_form(support, L, P, a, E, I, x)
+                  + deflection_udl_closed_form(support, L, w, E, I, x)).max())
+
+
+def support_layout(support: str, L: float, overhang: float = 0.0) -> list:
+    """Support positions and kinds, left to right: (x, 'pin' or 'fixed'). The first is always at x = 0."""
+    if support == SS:
+        return [(0.0, "pin"), (L, "pin")]
+    if support == CANT:
+        return [(0.0, "fixed")]
+    if support == FIXED:
+        return [(0.0, "fixed"), (L, "fixed")]
+    if support == PROPPED:
+        return [(0.0, "fixed"), (L, "pin")]
+    if support == OVER:
+        return [(0.0, "pin"), (L - overhang, "pin")]
+    raise ValidationError(f"Unknown support type '{support}'.")
+
+
+@dataclass
+class BeamSolution:
+    nodes: np.ndarray
+    w: np.ndarray        # downward deflection at the nodes
+    sup_x: list          # support positions
+    sup_kind: list       # 'pin' or 'fixed'
+    R: np.ndarray        # upward reaction force at each support
+    Mc: np.ndarray       # counter-clockwise reaction moment at each support (0 for simple supports)
+
+
+def fe_solve(support, L, P, a, w, E, I, overhang: float = 0.0, n_el: int = 80) -> BeamSolution:
     """Small 1D Euler-Bernoulli beam finite-element model (2 DOF per node: deflection, slope).
-    A node is placed exactly at the load. Returns (node x, downward deflection)."""
+    Handles any support layout above, a point load P at a and a full-length uniform load w (N/m, downward).
+    Nodes are placed exactly at the load and at every support. Returns deflection and reactions."""
+    _check_load_case(support, L, P, a, w, overhang)
+    sup = support_layout(support, L, overhang)
+    mand = np.array(sorted({0.0, L, a, *[x for x, _ in sup]}))
     xs = np.linspace(0.0, L, n_el + 1)
     tol = L / (4 * n_el)
-    keep = (np.abs(xs - a) > tol) | (xs == 0.0) | (xs == L)
-    nodes = np.unique(np.concatenate([xs[keep], [a]]))
+    keep = np.all(np.abs(xs[:, None] - mand[None, :]) > tol, axis=1)
+    nodes = np.unique(np.concatenate([xs[keep], mand]))
+    nodes = nodes[np.insert(np.diff(nodes) > 1e-9 * L, 0, True)]
     n = len(nodes)
     K = np.zeros((2 * n, 2 * n))
+    F = np.zeros(2 * n)
     for e in range(n - 1):
         l = nodes[e + 1] - nodes[e]
-        k = E * I / l**3 * np.array([[12, 6 * l, -12, 6 * l],
-                                     [6 * l, 4 * l**2, -6 * l, 2 * l**2],
-                                     [-12, -6 * l, 12, -6 * l],
-                                     [6 * l, 2 * l**2, -6 * l, 4 * l**2]])
+        k = 1.0 / l**3 * np.array([[12, 6 * l, -12, 6 * l],                                  # stiffness with EI = 1
+                                   [6 * l, 4 * l**2, -6 * l, 2 * l**2],
+                                   [-12, -6 * l, 12, -6 * l],
+                                   [6 * l, 2 * l**2, -6 * l, 4 * l**2]])
         K[2 * e:2 * e + 4, 2 * e:2 * e + 4] += k
-    F = np.zeros(2 * n)
-    F[2 * int(np.argmin(np.abs(nodes - a)))] = -P          # downward load
-    fixed = [0, 2 * (n - 1)] if support == SS else [0, 1]
+        F[2 * e:2 * e + 4] += np.array([-w * l / 2, -w * l**2 / 12, -w * l / 2, w * l**2 / 12])   # consistent UDL
+    F[2 * int(np.argmin(np.abs(nodes - a)))] -= P                                                # downward point load
+    fixed, idx = [], []
+    for x_s, kind in sup:
+        i = int(np.argmin(np.abs(nodes - x_s)))
+        idx.append(i)
+        fixed += [2 * i] + ([2 * i + 1] if kind == "fixed" else [])
     free = [i for i in range(2 * n) if i not in fixed]
     u = np.zeros(2 * n)
     u[free] = np.linalg.solve(K[np.ix_(free, free)], F[free])
-    return nodes, -u[0::2]
+    r = K @ u - F          # reactions at constrained DOFs (independent of E and I, which only scale the deflection)
+    u = u / (E * I)        # K was built with EI = 1
+    R = np.array([r[2 * i] for i in idx])
+    Mc = np.array([r[2 * i + 1] if kind == "fixed" else 0.0 for i, (_, kind) in zip(idx, sup)])
+    return BeamSolution(nodes, -u[0::2], [x for x, _ in sup], [k for _, k in sup], R, Mc)
+
+
+def fe_deflection(support, L, P, a, E, I, n_el: int = 80):
+    """Point-load finite-element deflection. Returns (node x, downward deflection)."""
+    sol = fe_solve(support, L, P, a, 0.0, E, I, 0.0, n_el)
+    return sol.nodes, sol.w
+
+
+def internal_forces(sol: BeamSolution, L, P, a, w, x):
+    """Shear V (up positive on the left face) and bending moment M (sagging positive) from equilibrium,
+    using the support reactions. Exact for point and uniform loads."""
+    x = np.asarray(x, dtype=float)
+    V, M = np.zeros_like(x), np.zeros_like(x)
+    for x_s, Rj in zip(sol.sup_x, sol.R):
+        if x_s < L * (1 - 1e-12):          # a reaction exactly at the right end is not part of V inside the beam
+            V = V + np.where(x >= x_s, Rj, 0.0)
+        M = M + Rj * np.maximum(x - x_s, 0.0)
+    if sol.sup_kind[0] == "fixed":
+        M = M - sol.Mc[0]                  # wall moment at the left end (counter-clockwise reaction = hogging)
+    V = V - P * (x >= a) - w * x
+    M = M - P * np.maximum(x - a, 0.0) - w * x**2 / 2
+    return V, M
+
+
+def reaction_summary(support, sol: BeamSolution) -> dict:
+    """Reactions for display: forces are upward-positive, moments are magnitudes."""
+    R, Mc = sol.R, np.abs(sol.Mc)
+    if support == SS:
+        return {"R_left": float(R[0]), "R_right": float(R[1])}
+    if support == CANT:
+        return {"R_fixed": float(R[0]), "M_fixed": float(Mc[0])}
+    if support == FIXED:
+        return {"R_left": float(R[0]), "R_right": float(R[1]), "M_left": float(Mc[0]), "M_right": float(Mc[1])}
+    if support == PROPPED:
+        return {"R_fixed": float(R[0]), "M_fixed": float(Mc[0]), "R_pinned": float(R[1])}
+    return {"R_left": float(R[0]), "R_right": float(R[1])}
 
 
 def bending_stress(M, c, I):
@@ -215,17 +327,20 @@ class Result:
     sigma_max: float            # bending, at the critical section
     tau_max: float              # torsion
     vm_max: float
-    w_max: float                # closed form
+    w_max: float                # closed form where available, otherwise the finite-element value
     w_max_fe: float
     sf: float
     sf_fatigue: Optional[float]
     n_req: float
     passed: bool
+    w_closed: Optional[float] = None    # closed-form maximum deflection (None: finite element only)
 
 
 def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
-            fatigue_R: Optional[float] = None, fatigue_k: float = 0.6) -> Result:
-    _check_load_case(support, L, P, a)
+            fatigue_R: Optional[float] = None, fatigue_k: float = 0.6, *, w=0.0, overhang=0.0) -> Result:
+    """P: point load (N) at a (m from the left end); w: full-length uniform load (N/m);
+    overhang: length of the overhang (m) for the overhanging beam."""
+    _check_load_case(support, L, P, a, w, overhang)
     require_non_negative(T, "Torque")
     require_positive(n_req, "Required safety factor")
     for name, v in (("E", material.E), ("Yield strength", material.Sy), ("Ultimate strength", material.Su)):
@@ -234,12 +349,21 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
     if T > 0 and sec.J is None:
         raise ValidationError("Torque needs a round section (solid or hollow). Rectangles are not modelled for torsion.")
 
-    x = np.unique(np.concatenate([np.linspace(0.0, L, 401), [a, max(a - 1e-9 * L, 0.0)]]))
-    V, M = shear(support, L, P, a, x), moment(support, L, P, a, x)
+    sol = fe_solve(support, L, P, a, w, material.E, sec.I, overhang)
+    extra = [a, max(a - 1e-9 * L, 0.0)]
+    for x_s in sol.sup_x:
+        extra += [x_s, max(x_s - 1e-9 * L, 0.0)]
+    x = np.unique(np.concatenate([np.linspace(0.0, L, 401), extra]))
+    V, M = internal_forces(sol, L, P, a, w, x)
+    cross = np.nonzero(V[:-1] * V[1:] < 0)[0]            # zero-shear points: where a uniform load puts the moment peak
+    if len(cross):
+        x0 = x[cross] + (x[cross + 1] - x[cross]) * V[cross] / (V[cross] - V[cross + 1])
+        x = np.unique(np.concatenate([x, x0]))
+        V, M = internal_forces(sol, L, P, a, w, x)
     tau = torsion_shear(T, sec.c, sec.J) if sec.J else 0.0
     vm_x = von_mises(bending_stress(M, sec.c, sec.I), tau)
 
-    sigma_max = max_moment(support, L, P, a) * sec.c / sec.I
+    sigma_max = float(np.max(np.abs(M))) * sec.c / sec.I
     vm_max = float(von_mises(sigma_max, tau))
     sf = float("inf") if vm_max == 0 else material.Sy / vm_max
 
@@ -250,11 +374,12 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
         s_a, s_m = vm_max * (1 - fatigue_R) / 2, vm_max * (1 + fatigue_R) / 2
         sf_f = goodman_factor(s_a, s_m, endurance_limit(material.Su, fatigue_k), material.Su)
 
-    x_fe, w_fe = fe_deflection(support, L, P, a, material.E, sec.I)
+    w_fe_max = float(np.max(np.abs(sol.w)))
+    w_cf = closed_form_max_deflection(support, L, P, a, w, material.E, sec.I)
     passed = sf >= n_req and (sf_f is None or sf_f >= n_req)
-    return Result(x, V, M, x_fe, w_fe, vm_x, sec, T, reactions(support, L, P, a), sigma_max,
-                  float(tau), vm_max, max_deflection(support, L, P, a, material.E, sec.I),
-                  float(w_fe.max()), sf, sf_f, n_req, passed)
+    return Result(x, V, M, sol.nodes, sol.w, vm_x, sec, T, reaction_summary(support, sol), sigma_max,
+                  float(tau), vm_max, w_cf if w_cf is not None else w_fe_max, w_fe_max, sf, sf_f, n_req,
+                  passed, w_cf)
 
 
 # =============================================================================================
@@ -264,16 +389,17 @@ def auto_exaggeration(L: float, w_max: float) -> float:
     return 1.0 if w_max <= 0 else float(np.clip(0.08 * L / w_max, 1.0, 500.0))
 
 
-def stress_map_figure(res: Result, material: Material, support, L, P, a, scale, system) -> go.Figure:
+def stress_map_figure(res: Result, material: Material, support, L, P, a, scale, system,
+                      w=0.0, overhang=0.0) -> go.Figure:
     """Section view through the axis, drawn on the deformed shape (vertical shear mapping of the
     undeformed field, so the pattern is exact). Colour = von Mises / yield: blue low, red at yield."""
     sec = res.section
     f = lambda v: units.from_si(v, "length_long", system)
     xg = np.linspace(0, L, 320)
     wg = np.interp(xg, res.x_fe, res.w_fe) * scale
-    Mg = np.abs(moment(support, L, P, a, xg))
+    Mg = np.abs(np.interp(xg, res.x, res.M))
     half = sec.depth / 2
-    y_hi, y_lo = half, -wg.max() - half
+    y_hi, y_lo = float(np.max(-wg)) + half, float(np.min(-wg)) - half
     span_y = y_hi - y_lo
     Yg = np.linspace(y_lo - 0.15 * span_y, y_hi + 0.30 * span_y, 400)
     absy = np.abs(Yg[:, None] + wg[None, :])               # material coordinate of each pixel
@@ -291,15 +417,27 @@ def stress_map_figure(res: Result, material: Material, support, L, P, a, scale, 
         fig.add_trace(go.Scatter(x=f(xg), y=f(-wg + sign * half), mode="lines", showlegend=False,
                                  line=dict(color="#333", width=1.5), hoverinfo="skip"))
     base = -half - 0.03 * (Yg[-1] - Yg[0])
-    if support == SS:
-        fig.add_trace(go.Scatter(x=[f(0), f(L)], y=[f(base)] * 2, mode="markers", showlegend=False,
+    sup = support_layout(support, L, overhang)
+    pins = [x for x, kind in sup if kind == "pin"]
+    if pins:
+        fig.add_trace(go.Scatter(x=[f(x) for x in pins], y=[f(base)] * len(pins), mode="markers", showlegend=False,
                                  marker=dict(symbol="triangle-up", size=16, color="#444"), hoverinfo="skip"))
-    else:
-        fig.add_shape(type="rect", x0=f(-0.03 * L), x1=f(0), y0=f(-2 * half), y1=f(2 * half),
-                      fillcolor="#555", line=dict(width=0))
+    for x, kind in sup:
+        if kind == "fixed":
+            x0, x1 = (-0.03 * L, 0.0) if x == 0 else (L, 1.03 * L)
+            fig.add_shape(type="rect", x0=f(x0), x1=f(x1), y0=f(-2 * half), y1=f(2 * half),
+                          fillcolor="#555", line=dict(width=0))
+    top_at = lambda xv: -float(np.interp(xv, xg, wg)) + half
+    if w > 0:
+        for xv in np.linspace(0.0, L, 11):
+            fig.add_annotation(x=f(xv), y=f(top_at(xv)), ax=0, ay=-30, showarrow=True, arrowhead=2,
+                               arrowwidth=1.5, arrowcolor="#111", text="")
+        right_side = P > 0 and a < 0.35 * L
+        fig.add_annotation(x=f(L if right_side else 0.0), y=f(top_at(L if right_side else 0.0)), showarrow=False,
+                           yshift=42, xanchor="right" if right_side else "left",
+                           text=f"w = {units.fmt(w, 'line_load', system)}", font=dict(size=13))
     if P > 0:
-        top = -float(np.interp(a, xg, wg)) + half
-        fig.add_annotation(x=f(a), y=f(top), ax=0, ay=-45, showarrow=True, arrowhead=2, arrowwidth=3,
+        fig.add_annotation(x=f(a), y=f(top_at(a)), ax=0, ay=-45, showarrow=True, arrowhead=2, arrowwidth=3,
                            arrowcolor="#111", text=f"P = {units.fmt(P, 'force', system)}", font=dict(size=13))
     xr = 1.1 * L
     h = int(np.clip(850 * (Yg[-1] - Yg[0]) / xr + 110, 260, 460))
@@ -346,11 +484,15 @@ def render() -> None:
     with left:
         mode = st.radio("Mode", ["Beam", "Shaft (bending + torque)"], key="bs_mode", horizontal=True)
         shaft = mode.startswith("Shaft")
-        support = st.selectbox("Supports", [SS, CANT], format_func=SUPPORT_LABELS.get, key="bs_support")
-        L = _slider("Span", "length_long", 0.2, 5.0, 1.0, "bs_span", system)
-        P = _slider("Load", "force", 0.0, 20000.0, 5000.0, "bs_load", system)
-        pct = st.slider("Load position (% of span from left end)", 0, 100, 50, key="bs_pos")
-        a = L * pct / 100
+        support = st.selectbox("Supports", list(SUPPORTS), format_func=SUPPORT_LABELS.get, key="bs_support")
+        L = _slider("Beam length" if support == OVER else "Span", "length_long", 0.2, 5.0, 1.0, "bs_span", system)
+        overhang = L * st.slider("Overhang (% of beam length)", 5, 40, 20, key="bs_overhang") / 100 if support == OVER else 0.0
+        load_type = st.radio("Load type", LOAD_TYPES, key="bs_loadtype", horizontal=True)
+        has_point, has_udl = load_type != LOAD_TYPES[1], load_type != LOAD_TYPES[0]
+        P = _slider("Point load", "force", 0.0, 20000.0, 5000.0, "bs_load", system) if has_point else 0.0
+        a = L * st.slider("Point load position (% of beam length from left end)", 0, 100, 50, key="bs_pos") / 100 \
+            if has_point else L / 2
+        w = _slider("Uniform load (full length)", "line_load", 0.0, 20000.0, 5000.0, "bs_udl", system) if has_udl else 0.0
         shapes = ["solid_round", "hollow_round"] if shaft else list(SHAPE_LABELS)
         shape = st.selectbox("Cross-section", shapes, format_func=SHAPE_LABELS.get,
                              key="bs_shape_shaft" if shaft else "bs_shape_beam")
@@ -373,7 +515,7 @@ def render() -> None:
             R = st.slider("Load ratio R = P_min / P_max (−1 = fully reversed)", -1.0, 1.0, 0.0, 0.1, key="bs_R")
             k = st.slider("Fatigue reduction factor k (surface, size, reliability)", 0.2, 1.0, 0.6, 0.05, key="bs_k")
 
-    res = analyse(support, L, P, a, shape, dims, material, T, n_req, R, k if k else 0.6)
+    res = analyse(support, L, P, a, shape, dims, material, T, n_req, R, k if k else 0.6, w=w, overhang=overhang)
 
     with right:
         if L / res.section.depth < 5:
@@ -395,16 +537,20 @@ def render() -> None:
         scale_auto = auto_exaggeration(L, res.w_max)
         auto = st.toggle("Auto deflection exaggeration", value=True, key="bs_auto")
         scale = scale_auto if auto else float(st.slider("Exaggeration ×", 1, 500, 50, key="bs_scale"))
-        st.plotly_chart(stress_map_figure(res, material, support, L, P, a, scale, system), width="stretch")
+        st.plotly_chart(stress_map_figure(res, material, support, L, P, a, scale, system, w, overhang), width="stretch")
         st.plotly_chart(diagram_figure(res, system), width="stretch")
-        diff = abs(res.w_max_fe - res.w_max) / res.w_max * 100 if res.w_max > 0 else 0.0
-        st.caption(f"Deformed shape: 1D beam finite-element model. Max deflection: closed form "
-                   f"(FE differs by {diff:.4f} %). Reactions: "
-                   + ", ".join(f"{k_} = {units.fmt(v, 'force' if k_.startswith('R') else 'torque', system)}"
-                               for k_, v in res.reactions.items()))
+        reac = ", ".join(f"{k_} = {units.fmt(v, 'force' if k_.startswith('R') else 'torque', system)}"
+                         for k_, v in res.reactions.items())
+        if res.w_closed is not None:
+            diff = abs(res.w_max_fe - res.w_max) / res.w_max * 100 if res.w_max > 0 else 0.0
+            st.caption(f"Deformed shape: 1D beam finite-element model. Max deflection: closed form "
+                       f"(FE differs by {diff:.4f} %). Reactions: {reac}")
+        else:
+            st.caption(f"Deformed shape and max deflection: 1D beam finite-element model (checked against textbook "
+                       f"cases in the tests). Reactions: {reac}")
         with st.expander("Method and limits"):
             st.markdown(
-                "- Linear-elastic Euler-Bernoulli beam; one point load; self-weight ignored.\n"
+                "- Linear-elastic Euler-Bernoulli beam; one point load and/or a full-length uniform load; self-weight ignored.\n"
                 "- Stress at the outer fibre of the critical section: σ = M·c/I; torsion τ = T·c/J; "
                 "von Mises σ<sub>vm</sub> = √(σ² + 3τ²). Safety factor = yield / σ<sub>vm</sub>.\n"
                 "- Transverse shear, stress concentrations, buckling and contact stresses are **not** included.\n"

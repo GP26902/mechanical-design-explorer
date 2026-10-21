@@ -15,6 +15,7 @@ UNITS: dict[str, dict[str, tuple[str, float]]] = {
     "length":       {SI: ("mm", 1e-3),   US: ("in", 0.0254)},       # section sizes, diameters
     "length_long":  {SI: ("m", 1.0),     US: ("ft", 0.3048)},       # spans, pipe runs
     "force":        {SI: ("N", 1.0),     US: ("lbf", 4.4482216152605)},
+    "line_load":    {SI: ("N/m", 1.0),   US: ("lbf/ft", 14.593902937206)},   # force per length, uniform loads
     "torque":       {SI: ("N·m", 1.0),   US: ("lbf·in", 0.1129848290276)},
     "pressure":     {SI: ("kPa", 1e3),   US: ("psi", 6894.757293168)},
     "stress":       {SI: ("MPa", 1e6),   US: ("ksi", 6.894757293168e6)},
