@@ -27,15 +27,16 @@ from common.validation import (ValidationError, require_in_range, require_less_t
 
 TITLE = "1 · Beam & shaft stress"
 KEY_PREFIX = "bs_"
-ABOUT = """**Method.** A small 1D Euler-Bernoulli beam finite-element model (a cross-check-grade tool, not general FEA) gives reactions and deflection for five support cases under a point load and/or a full-length uniform load. Shear and moment follow from equilibrium. For simply supported and cantilever beams the maximum deflection is shown from closed-form equations and the finite-element result is the cross-check. Shaft mode adds torsion (τ = Tc/J) and a von Mises equivalent stress. The optional fatigue check uses the Goodman relation.
+ABOUT = """**Method.** A small 1D Euler-Bernoulli beam finite-element model (a cross-check-grade tool, not general FEA) gives reactions and deflection for five support cases under a point load and/or a full-length uniform load. Shear and moment follow from equilibrium. For simply supported and cantilever beams the maximum deflection is shown from closed-form equations and the finite-element result is the cross-check. Shaft mode adds torsion (τ = Tc/J), a von Mises equivalent stress and, for the optional Goodman fatigue check, a stress concentration factor Kt on the alternating stress. Column mode screens buckling with Euler (long columns) and the Johnson parabola (short and intermediate columns) for four end conditions.
 
-**Checked in pytest:** reactions, shear and moment (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12) and centre deflections; propped cantilever reactions and wall moment; overhanging beam reactions, support moment and tip deflection; force and moment equilibrium for every support and load case; section properties (rectangle, round, tube, rectangular tube, I-beam); torsion; von Mises; custom material and deflection limit checks; endurance limit and Goodman.
+**Checked in pytest:** reactions, shear and moment (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12) and centre deflections; propped cantilever reactions and wall moment; overhanging beam reactions, support moment and tip deflection; force and moment equilibrium for every support and load case; section properties (rectangle, round, tube, rectangular tube, I-beam); torsion; von Mises; endurance limit, Goodman and the Kt factor; custom material and deflection limit checks; Euler load π²EI/(KL)² for four end conditions, the Johnson curve (continuity with Euler at λc), weaker-axis section properties and buckling-mode boundary conditions.
 
-**Limitations:** linear elastic, one point load and/or a full-length uniform load, self-weight ignored. Transverse shear, web crippling, local buckling of thin walls, stress concentrations and contact stresses are not included. Rectangular tubes and I-beams are bending only (no torsion).
+**Limitations:** linear elastic, one point load and/or a full-length uniform load, self-weight ignored. Transverse shear, web crippling, local buckling of thin walls, stress concentrations (apart from the Kt input) and contact stresses are not included. Rectangular tubes and I-beams are bending only (no torsion). Columns are straight and centrally loaded, with no imperfections or eccentricity; this is a classroom Euler/Johnson screen, not a code-based column design.
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Five support cases under point and uniform loads using a small 1D finite-element model checked against "
-               "textbook equations: stress map, deformed shape, shear and moment diagrams, safety factor and optional Goodman fatigue check.")
+               "textbook equations: stress map, deformed shape, shear and moment diagrams, safety factor, optional Goodman "
+               "fatigue check, and a column buckling mode (Euler and Johnson).")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
@@ -377,9 +378,10 @@ def deflection_limit_items(support, L, overhang, sol: BeamSolution, w_max, ratio
 
 def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
             fatigue_R: Optional[float] = None, fatigue_k: float = 0.6, *, w=0.0, overhang=0.0,
-            defl_ratio: Optional[float] = None) -> Result:
+            defl_ratio: Optional[float] = None, kt: float = 1.0) -> Result:
     """P: point load (N) at a (m from the left end); w: full-length uniform load (N/m);
-    overhang: length of the overhang (m) for the overhanging beam."""
+    overhang: length of the overhang (m) for the overhanging beam; kt: fatigue stress concentration factor,
+    applied to the alternating stress only (notch sensitivity taken as 1, conservative)."""
     _check_load_case(support, L, P, a, w, overhang)
     require_non_negative(T, "Torque")
     require_positive(n_req, "Required safety factor")
@@ -413,7 +415,8 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
     if fatigue_R is not None:
         require_in_range(fatigue_R, "Stress ratio R", -1.0, 1.0)
         require_in_range(fatigue_k, "Fatigue reduction factor", 0.05, 1.0)
-        s_a, s_m = vm_max * (1 - fatigue_R) / 2, vm_max * (1 + fatigue_R) / 2
+        require_in_range(kt, "Stress concentration factor Kt", 1.0, 10.0)
+        s_a, s_m = kt * vm_max * (1 - fatigue_R) / 2, vm_max * (1 + fatigue_R) / 2
         sf_f = goodman_factor(s_a, s_m, endurance_limit(material.Su, fatigue_k), material.Su)
 
     w_fe_max = float(np.max(np.abs(sol.w)))
@@ -425,6 +428,122 @@ def analyse(support, L, P, a, shape, dims, material: Material, T=0.0, n_req=1.5,
     return Result(x, V, M, sol.nodes, sol.w, vm_x, sec, T, reaction_summary(support, sol), sigma_max,
                   float(tau), vm_max, w_show, w_fe_max, sf, sf_f, n_req, strength_ok and defl_ok, w_cf,
                   strength_ok, defl_ratio, items, defl_ok)
+
+
+# =============================================================================================
+# COLUMN BUCKLING (pure functions): Euler for long columns, Johnson parabola for short ones
+# =============================================================================================
+COLUMN_ENDS = {"Pinned-pinned": 1.0, "Fixed-free (flagpole)": 2.0, "Fixed-pinned": 0.7, "Fixed-fixed": 0.5}
+KL_FIXED_PINNED = 4.493409457909064         # first root of tan(x) = x: the fixed-pinned buckling mode
+
+
+@dataclass(frozen=True)
+class ColumnSection:
+    A: float
+    I_x: float        # about the horizontal axis (depth direction h)
+    I_y: float        # about the vertical axis (width direction)
+    I_min: float
+    r: float          # radius of gyration about the weaker axis
+
+
+def column_section(shape: str, **dims) -> ColumnSection:
+    """Area and the weaker-axis second moment of area (a column buckles about its weaker axis)."""
+    sec = section_properties(shape, **dims)           # also validates the dimensions
+    Ix = sec.I
+    if shape == "rectangle":
+        Iy = dims["h"] * dims["b"] ** 3 / 12
+    elif shape == "hollow_rect":
+        b, h, t = dims["b"], dims["h"], dims["t"]
+        Iy = (h * b**3 - (h - 2 * t) * (b - 2 * t) ** 3) / 12
+    elif shape == "i_beam":
+        bf, tf, h, tw = dims["bf"], dims["tf"], dims["h"], dims["tw"]
+        Iy = 2 * tf * bf**3 / 12 + (h - 2 * tf) * tw**3 / 12
+    else:                                              # solid and hollow round: the same about every axis
+        Iy = Ix
+    I_min = min(Ix, Iy)
+    return ColumnSection(sec.A, Ix, Iy, I_min, float(np.sqrt(I_min / sec.A)))
+
+
+def euler_load(E: float, I: float, K: float, L: float) -> float:
+    """Euler critical load Pcr = pi^2 E I / (K L)^2."""
+    return float(np.pi**2 * E * I / (K * L) ** 2)
+
+
+def critical_slenderness(E: float, Sy: float) -> float:
+    """Slenderness where the Euler and Johnson curves meet: sqrt(2 pi^2 E / Sy)."""
+    return float(np.sqrt(2 * np.pi**2 * E / Sy))
+
+
+def column_curve(E: float, Sy: float, lam):
+    """Critical stress against slenderness: (Euler, Johnson), both in Pa."""
+    lam = np.asarray(lam, dtype=float)
+    return np.pi**2 * E / lam**2, Sy * (1 - Sy * lam**2 / (4 * np.pi**2 * E))
+
+
+@dataclass
+class ColumnResult:
+    section: ColumnSection
+    end: str
+    K: float
+    L: float
+    P: float
+    slenderness: float
+    lam_c: float
+    regime: str            # "Euler" or "Johnson"
+    P_cr: float
+    P_euler: float         # Euler value for reference (overestimates for short columns)
+    sigma_cr: float
+    sigma_applied: float
+    sf: float
+    n_req: float
+    passed: bool
+
+
+def analyse_column(end: str, L: float, P: float, shape: str, dims: dict, material: Material,
+                   n_req: float = 1.5) -> ColumnResult:
+    """Straight, centrally loaded column. Long columns (slenderness >= lam_c): Euler.
+    Short and intermediate columns: Johnson parabola Pcr = A Sy (1 - Sy lam^2 / (4 pi^2 E))."""
+    if end not in COLUMN_ENDS:
+        raise ValidationError(f"Unknown end condition '{end}'.")
+    require_positive(L, "Length")
+    require_non_negative(P, "Axial load")
+    require_positive(n_req, "Required safety factor")
+    for name, v in (("E", material.E), ("Yield strength", material.Sy), ("Ultimate strength", material.Su)):
+        require_positive(v, name)
+    if material.Su < material.Sy:
+        raise ValidationError("Ultimate strength must be at least the yield strength.")
+    sec = column_section(shape, **dims)
+    K = COLUMN_ENDS[end]
+    lam = K * L / sec.r
+    lam_c = critical_slenderness(material.E, material.Sy)
+    P_euler = euler_load(material.E, sec.I_min, K, L)
+    if lam >= lam_c:
+        regime, P_cr = "Euler", P_euler
+    else:
+        regime, P_cr = "Johnson", sec.A * material.Sy * (1 - material.Sy * lam**2 / (4 * np.pi**2 * material.E))
+    sf = float("inf") if P == 0 else P_cr / P
+    return ColumnResult(sec, end, K, L, P, float(lam), lam_c, regime, float(P_cr), P_euler, P_cr / sec.A, P / sec.A,
+                        sf, n_req, sf >= n_req)
+
+
+def _mode(end: str, xi):
+    if end == "Pinned-pinned":
+        return np.sin(np.pi * xi)
+    if end == "Fixed-free (flagpole)":
+        return 1 - np.cos(np.pi * xi / 2)
+    if end == "Fixed-fixed":
+        return (1 - np.cos(2 * np.pi * xi)) / 2
+    if end == "Fixed-pinned":
+        kx = KL_FIXED_PINNED * xi                     # y = (1 - cos kx) - cot(kL)(kx - sin kx)
+        return (1 - np.cos(kx)) - (np.cos(KL_FIXED_PINNED) / np.sin(KL_FIXED_PINNED)) * (kx - np.sin(kx))
+    raise ValidationError(f"Unknown end condition '{end}'.")
+
+
+def buckled_shape(end: str, xi):
+    """First buckling mode, lateral deflection along the column (xi = 0 at the base, 1 at the top),
+    scaled to a maximum of 1. The base is fixed for every end condition except pinned-pinned."""
+    peak = np.max(np.abs(_mode(end, np.linspace(0.0, 1.0, 2001))))
+    return _mode(end, np.asarray(xi, dtype=float)) / peak
 
 
 # =============================================================================================
@@ -507,6 +626,73 @@ def diagram_figure(res: Result, system) -> go.Figure:
     return fig
 
 
+def column_figure(res: ColumnResult, system) -> go.Figure:
+    """Column with its end supports, axial load and first buckling mode (shape only, amplitude arbitrary)."""
+    f = lambda v: units.from_si(v, "length_long", system)
+    L, end = res.L, res.end
+    xi = np.linspace(0.0, 1.0, 201)
+    lat = 0.10 * L * buckled_shape(end, xi)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=[0, 0], y=[f(0), f(L)], mode="lines", showlegend=False, hoverinfo="skip",
+                             line=dict(color="#999", dash="dash", width=1.5)))
+    fig.add_trace(go.Scatter(x=f(lat), y=f(xi * L), mode="lines", showlegend=False, hoverinfo="skip",
+                             line=dict(color=ACCENT, width=7)))
+    top_x = float(lat[-1])
+    pin_base = end == "Pinned-pinned"
+    top_pinned = end in ("Pinned-pinned", "Fixed-pinned")
+    if pin_base:
+        fig.add_trace(go.Scatter(x=[0], y=[f(-0.02 * L)], mode="markers", showlegend=False, hoverinfo="skip",
+                                 marker=dict(symbol="triangle-up", size=18, color="#444")))
+    else:
+        fig.add_shape(type="rect", x0=f(-0.12 * L), x1=f(0.12 * L), y0=f(-0.05 * L), y1=f(0), fillcolor="#555",
+                      line=dict(width=0))
+    if top_pinned:
+        fig.add_trace(go.Scatter(x=[0], y=[f(1.02 * L)], mode="markers", showlegend=False, hoverinfo="skip",
+                                 marker=dict(symbol="triangle-down", size=18, color="#444")))
+    elif end == "Fixed-fixed":
+        fig.add_shape(type="rect", x0=f(-0.12 * L), x1=f(0.12 * L), y0=f(L), y1=f(1.05 * L), fillcolor="#555",
+                      line=dict(width=0))
+    top_y = L * (1.07 if (top_pinned or end == "Fixed-fixed") else 1.0)
+    fig.add_annotation(x=f(top_x), y=f(top_y), ax=0, ay=-55, showarrow=True, arrowhead=2, arrowwidth=3,
+                       arrowcolor="#111", text=f"P = {units.fmt(res.P, 'force', system)}", font=dict(size=13))
+    apply_theme(fig, f"First buckling mode, {end.lower()} (shape only, amplitude arbitrary)", 460)
+    fig.update_xaxes(range=[f(-0.5 * L), f(0.5 * L)], showticklabels=False, showgrid=False, zeroline=False)
+    fig.update_yaxes(range=[f(-0.1 * L), f(1.3 * L)], scaleanchor="x", showgrid=False,
+                     title=f"Height ({units.label('length_long', system)})")
+    return fig
+
+
+def strength_chart_figure(res: ColumnResult, material: Material, system) -> go.Figure:
+    """Critical stress against slenderness: Johnson parabola, Euler hyperbola, yield line and this column."""
+    s_ = lambda v: units.from_si(v, "stress", system)
+    E, Sy = material.E, material.Sy
+    lam_max = max(1.25 * res.slenderness, 1.6 * res.lam_c, 120.0)
+    lam = np.linspace(1.0, lam_max, 500)
+    euler, johnson = column_curve(E, Sy, lam)
+    short, long_ = lam <= res.lam_c, lam >= res.lam_c
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=lam[short], y=s_(johnson[short]), mode="lines", name="Johnson (short, intermediate)",
+                             line=dict(color=ACCENT, width=3)))
+    fig.add_trace(go.Scatter(x=lam[long_], y=s_(euler[long_]), mode="lines", name="Euler (long)",
+                             line=dict(color="#d62728", width=3)))
+    over = short & (euler <= 1.3 * Sy)
+    fig.add_trace(go.Scatter(x=lam[over], y=s_(euler[over]), mode="lines", name="Euler beyond its range (not valid)",
+                             line=dict(color="#d62728", width=1.5, dash="dot")))
+    fig.add_hline(y=s_(Sy), line=dict(color="#888", dash="dash", width=1),
+                  annotation_text="yield strength", annotation_position="top right")
+    fig.add_vline(x=res.lam_c, line=dict(color="#888", dash="dot", width=1),
+                  annotation_text=f"λc = {res.lam_c:.0f}", annotation_position="top left")
+    fig.add_trace(go.Scatter(x=[res.slenderness], y=[s_(res.sigma_cr)], mode="markers", name="Critical stress (this column)",
+                             marker=dict(symbol="diamond", size=12, color="#222")))
+    fig.add_trace(go.Scatter(x=[res.slenderness], y=[s_(res.sigma_applied)], mode="markers", name="Applied stress P/A",
+                             marker=dict(symbol="star", size=14, color="#ff7f0e", line=dict(color="#222", width=1))))
+    apply_theme(fig, "Column strength chart (below the curve is safe)", 420)
+    fig.update_xaxes(title="Slenderness ratio λ = K·L / r")
+    fig.update_yaxes(title=f"Stress ({units.label('stress', system)})", range=[0, s_(1.25 * Sy)])
+    fig.update_layout(legend=dict(orientation="h", y=-0.28))
+    return fig
+
+
 # =============================================================================================
 # UI
 # =============================================================================================
@@ -530,12 +716,91 @@ def _stress_input(label, default_si, key, system):
     return units.to_si(v, "stress", system)
 
 
+MODES = ["Beam", "Shaft (bending + torque)", "Column (buckling)"]
+
+
+def _section_inputs(shape: str, system) -> dict:
+    if shape == "rectangle":
+        return {"b": _size("Width b", 0.030, "bs_b", system), "h": _size("Depth h", 0.040, "bs_h", system)}
+    if shape == "solid_round":
+        return {"d": _size("Diameter d", 0.040, "bs_d", system)}
+    if shape == "hollow_round":
+        return {"d_o": _size("Outer diameter", 0.050, "bs_do", system),
+                "d_i": _size("Inner diameter", 0.040, "bs_di", system)}
+    if shape == "hollow_rect":
+        return {"b": _size("Width b", 0.040, "bs_rb", system), "h": _size("Depth h", 0.060, "bs_rh", system),
+                "t": _size("Wall thickness t", 0.004, "bs_rt", system)}
+    return {"bf": _size("Flange width", 0.100, "bs_ibf", system), "tf": _size("Flange thickness", 0.008, "bs_itf", system),
+            "h": _size("Total depth h", 0.200, "bs_ih", system), "tw": _size("Web thickness", 0.006, "bs_itw", system)}
+
+
+def _material_inputs(system) -> Material:
+    mat_name = st.selectbox("Material (typical values, illustrative)", [*MATERIALS, CUSTOM_MATERIAL], key="bs_material")
+    if mat_name == CUSTOM_MATERIAL:
+        base = MATERIALS["Steel AISI 1018 (cold drawn)"]
+        st.caption("Custom values are whatever you enter; check them against your material certificate.")
+        return Material("Custom", _stress_input("Elastic modulus E", base.E, "bs_cE", system),
+                        _stress_input("Yield strength", base.Sy, "bs_cSy", system),
+                        _stress_input("Ultimate strength", base.Su, "bs_cSu", system))
+    material = MATERIALS[mat_name]
+    st.caption(f"E = {units.fmt(material.E, 'stress', system, 4)}, yield = {units.fmt(material.Sy, 'stress', system)}, "
+               f"ultimate = {units.fmt(material.Su, 'stress', system)}")
+    return material
+
+
+def _render_column(left, right, system) -> None:
+    with left:
+        end = st.selectbox("End conditions", list(COLUMN_ENDS),
+                           format_func=lambda e: f"{e} (K = {COLUMN_ENDS[e]:g})", key="bs_cend")
+        L = _slider("Column length", "length_long", 0.1, 5.0, 1.0, "bs_clen", system)
+        P = _slider("Axial load (compression)", "force", 0.0, 200000.0, 60000.0, "bs_cload", system)
+        shape = st.selectbox("Cross-section", list(SHAPE_LABELS), format_func=SHAPE_LABELS.get, key="bs_shape_col")
+        dims = _section_inputs(shape, system)
+        material = _material_inputs(system)
+        n_req = st.slider("Required safety factor", 1.0, 4.0, 1.5, 0.1, key="bs_nreq")
+    res = analyse_column(end, L, P, shape, dims, material, n_req)
+    with right:
+        if res.slenderness > 200:
+            st.warning("Slenderness above 200: very slender columns are unusual and extremely sensitive to "
+                       "imperfections; treat the result with extra caution.")
+        if res.passed:
+            st.success((f"PASS: safety factor {res.sf:.2f} ≥ required {n_req:.1f} ({res.regime} buckling)"
+                        if np.isfinite(res.sf) else "PASS: no load applied"))
+        else:
+            st.error(f"FAIL: safety factor {res.sf:.2f} is below the required {n_req:.1f} ({res.regime} buckling)")
+        c1, c2 = st.columns(2)
+        c1.metric("Slenderness ratio λ = K·L/r", f"{res.slenderness:.0f}")
+        c2.metric("Critical buckling load", units.fmt(res.P_cr, "force", system))
+        c3, c4 = st.columns(2)
+        c3.metric("Safety factor (Pcr / P)", "∞" if not np.isfinite(res.sf) else f"{res.sf:.2f}")
+        c4.metric("Formula used", f"{res.regime} (λc = {res.lam_c:.0f})")
+        st.plotly_chart(column_figure(res, system), width="stretch")
+        st.plotly_chart(strength_chart_figure(res, material, system), width="stretch")
+        st.caption(f"Weaker-axis second moment of area I = {res.section.I_min * 1e12:,.0f} mm⁴ "
+                   f"(radius of gyration r = {res.section.r * 1e3:.2f} mm). The buckling shape is qualitative.")
+        with st.expander("Method and limits"):
+            st.markdown(
+                "- Slenderness λ = K·L/r, with r from the **weaker** axis. K = 1 (pinned-pinned), 2 (fixed-free), "
+                "0.7 (fixed-pinned) and 0.5 (fixed-fixed): theoretical values, not code design values.\n"
+                "- Long columns (λ ≥ λ<sub>c</sub> = √(2π²E/S<sub>y</sub>)): Euler, P<sub>cr</sub> = π²EI/(KL)².\n"
+                "- Short and intermediate columns: Johnson parabola, P<sub>cr</sub> = A·S<sub>y</sub>·(1 − "
+                "S<sub>y</sub>λ²/(4π²E)). The two curves meet exactly at λ<sub>c</sub>.\n"
+                "- Safety factor = P<sub>cr</sub> / applied load.\n"
+                "- A straight, centrally loaded column with no imperfections, eccentricity, residual stress or local "
+                "buckling. This is a classroom Euler/Johnson screen, **not** a code-based column design (it does not follow "
+                "AISC or similar rules).", unsafe_allow_html=True)
+
+
 def render() -> None:
     system = get_unit_system()
     left, right = st.columns([1, 2], gap="large")
     with left:
-        mode = st.radio("Mode", ["Beam", "Shaft (bending + torque)"], key="bs_mode", horizontal=True)
-        shaft = mode.startswith("Shaft")
+        mode = st.radio("Mode", MODES, key="bs_mode", horizontal=True)
+    if mode == MODES[2]:
+        _render_column(left, right, system)
+        return
+    shaft = mode == MODES[1]
+    with left:
         support = st.selectbox("Supports", list(SUPPORTS), format_func=SUPPORT_LABELS.get, key="bs_support")
         L = _slider("Beam length" if support == OVER else "Span", "length_long", 0.2, 5.0, 1.0, "bs_span", system)
         overhang = L * st.slider("Overhang (% of beam length)", 5, 40, 20, key="bs_overhang") / 100 if support == OVER else 0.0
@@ -548,44 +813,25 @@ def render() -> None:
         shapes = ["solid_round", "hollow_round"] if shaft else list(SHAPE_LABELS)
         shape = st.selectbox("Cross-section", shapes, format_func=SHAPE_LABELS.get,
                              key="bs_shape_shaft" if shaft else "bs_shape_beam")
-        if shape == "rectangle":
-            dims = {"b": _size("Width b", 0.030, "bs_b", system), "h": _size("Depth h", 0.040, "bs_h", system)}
-        elif shape == "solid_round":
-            dims = {"d": _size("Diameter d", 0.040, "bs_d", system)}
-        elif shape == "hollow_round":
-            dims = {"d_o": _size("Outer diameter", 0.050, "bs_do", system),
-                    "d_i": _size("Inner diameter", 0.040, "bs_di", system)}
-        elif shape == "hollow_rect":
-            dims = {"b": _size("Width b", 0.040, "bs_rb", system), "h": _size("Depth h", 0.060, "bs_rh", system),
-                    "t": _size("Wall thickness t", 0.004, "bs_rt", system)}
-        else:
-            dims = {"bf": _size("Flange width", 0.100, "bs_ibf", system),
-                    "tf": _size("Flange thickness", 0.008, "bs_itf", system),
-                    "h": _size("Total depth h", 0.200, "bs_ih", system),
-                    "tw": _size("Web thickness", 0.006, "bs_itw", system)}
+        dims = _section_inputs(shape, system)
         T = _slider("Torque", "torque", 0.0, 1000.0, 150.0, "bs_T", system) if shaft else 0.0
-        mat_name = st.selectbox("Material (typical values, illustrative)", [*MATERIALS, CUSTOM_MATERIAL],
-                                key="bs_material")
-        if mat_name == CUSTOM_MATERIAL:
-            base = MATERIALS["Steel AISI 1018 (cold drawn)"]
-            material = Material("Custom", _stress_input("Elastic modulus E", base.E, "bs_cE", system),
-                                _stress_input("Yield strength", base.Sy, "bs_cSy", system),
-                                _stress_input("Ultimate strength", base.Su, "bs_cSu", system))
-            st.caption("Custom values are whatever you enter; check them against your material certificate.")
-        else:
-            material = MATERIALS[mat_name]
-            st.caption(f"E = {units.fmt(material.E, 'stress', system, 4)}, yield = {units.fmt(material.Sy, 'stress', system)}, "
-                       f"ultimate = {units.fmt(material.Su, 'stress', system)}")
+        material = _material_inputs(system)
         n_req = st.slider("Required safety factor", 1.0, 4.0, 1.5, 0.1, key="bs_nreq")
         defl_label = st.selectbox("Deflection limit (span ÷ ratio)", list(DEFL_LIMITS), key="bs_defl")
         fatigue = st.checkbox("Fatigue check (Goodman)", key="bs_fatigue")
         R = k = None
+        kt = 1.0
         if fatigue:
             R = st.slider("Load ratio R = P_min / P_max (−1 = fully reversed)", -1.0, 1.0, 0.0, 0.1, key="bs_R")
             k = st.slider("Fatigue reduction factor k (surface, size, reliability)", 0.2, 1.0, 0.6, 0.05, key="bs_k")
+            if shaft:
+                kt = st.slider("Stress concentration factor Kt (shoulder, keyway, hole)", 1.0, 3.0, 1.0, 0.05, key="bs_kt")
+                st.caption("Read Kt from a handbook chart for your actual geometry. It multiplies the alternating stress "
+                           "in the Goodman check only (notch sensitivity taken as 1, conservative); the static safety "
+                           "factor is unchanged.")
 
     res = analyse(support, L, P, a, shape, dims, material, T, n_req, R, k if k else 0.6, w=w, overhang=overhang,
-                  defl_ratio=DEFL_LIMITS[defl_label])
+                  defl_ratio=DEFL_LIMITS[defl_label], kt=kt)
 
     with right:
         if L / res.section.depth < 5:
@@ -638,8 +884,9 @@ def render() -> None:
                 "length for a cantilever (conservative).\n"
                 "- Transverse shear, web crippling, local buckling of thin walls, stress concentrations and contact stresses are "
                 "**not** included.\n"
-                "- Goodman: n = 1/(σ<sub>a</sub>/S<sub>e</sub> + σ<sub>m</sub>/S<sub>u</sub>), with simplified "
-                "S<sub>e</sub> = k·0.5·S<sub>u</sub> (cap 700 MPa); the same load ratio R is applied to bending and torque.\n"
+                "- Goodman: n = 1/(K<sub>t</sub>σ<sub>a</sub>/S<sub>e</sub> + σ<sub>m</sub>/S<sub>u</sub>), with simplified "
+                "S<sub>e</sub> = k·0.5·S<sub>u</sub> (cap 700 MPa); the same load ratio R is applied to bending and torque. "
+                "K<sub>t</sub> (shaft mode) multiplies the alternating stress only.\n"
                 "- The 1D finite-element model is not a general FEA tool.", unsafe_allow_html=True)
 
 
