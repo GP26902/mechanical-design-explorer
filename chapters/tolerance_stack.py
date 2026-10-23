@@ -1,7 +1,9 @@
 """Chapter 3: Tolerance stack-up & GD&T position.
 
 Learning tool based on ASME Y14.5 concepts; NOT a certified interpretation of the standard.
-Size stack-up (one-dimensional, linear): worst-case, RSS (root-sum-square) and Monte Carlo.
+Size stack-up (one-dimensional, linear): worst-case, RSS (root-sum-square) and Monte Carlo, with a normal,
+uniform or triangular distribution and an optional mean shift per dimension, Cp/Cpk/ppm/sigma level, and a
+tolerance budget solver for a target Cpk.
 GD&T: position tolerance zone with bonus tolerance at MMC (or RFS, no bonus) for a hole or pin.
 No FEA/CFD of any kind; the Monte Carlo is plain random sampling of the dimension distributions.
 """
@@ -26,14 +28,15 @@ from common.validation import ValidationError, require_in_range, require_non_neg
 
 TITLE = "3 · Tolerance stack-up & GD&T"
 KEY_PREFIX = "ts_"
-ABOUT = """**Method.** One-dimensional tolerance stacks compared three ways: worst-case, RSS (√Σt²) and Monte Carlo. Each tolerance band is treated as ±kσ of a normal distribution (k selectable). Cpk, percent out of spec and each dimension's contribution are shown. The GD&T tab draws a position tolerance zone with bonus tolerance at MMC and compares it with RFS. It is a learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.
+ABOUT = """**Method.** One-dimensional tolerance stacks compared three ways: worst-case, RSS (√Σσ²) and Monte Carlo. Each row has a distribution: normal (tolerance = ±kσ, k selectable), uniform (σ² = t²/3) or triangular (σ² = t²/6), where t is the half-width of the band. An optional mean shift moves a dimension's process mean away from the band centre. Cp, Cpk, estimated ppm out of spec, sigma level (3·Cpk), each dimension's contribution and a tolerance budget solver (scale factor to reach a target Cpk) are shown. Example stacks can be loaded into the table; the results table downloads as CSV. The GD&T tab draws a position tolerance zone with bonus tolerance at MMC and compares it with RFS. It is a learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.
 
-**Checked in pytest:** worst-case, RSS and Cpk against hand values; asymmetric tolerances; contribution shares; Monte Carlo against the analytic mean, σ and tail fraction (fixed seed); bonus tolerance, zone and virtual condition; RFS; boundary cases.
+**Checked in pytest:** worst-case, RSS and Cpk against hand values; the three distribution variances; mean shift; Monte Carlo against the analytic mean, σ and tail fraction (fixed seed); Cp, ppm and sigma level; the budget scale factor and its round trip; example stacks; CSV contents; asymmetric tolerances; contribution shares; bonus tolerance, zone and virtual condition; RFS; boundary cases.
 
-**Limitations:** 1D linear stacks, no process drift, correlation or non-normal distributions. GD&T covers one feature with one position zone (no datum frames, composite or projected zones, orientation or form controls, LMC).
+**Limitations:** 1D linear stacks, no correlation between dimensions. Cpk and ppm from RSS assume the summed gap is roughly normal. GD&T covers one feature with one position zone (no datum frames, composite or projected zones, orientation or form controls, LMC).
 
 For learning and screening, not certified design."""
-DESCRIPTION = ("Worst-case, RSS and Monte Carlo stack-ups with Cpk and contribution ranking, plus a "
+DESCRIPTION = ("Worst-case, RSS and Monte Carlo stack-ups (normal, uniform or triangular rows) with Cp, Cpk, ppm, a "
+               "tolerance budget solver and contribution ranking, plus a "
                "GD&T position tolerance zone with bonus tolerance at MMC (learning tool, ASME Y14.5 concepts).")
 
 # =============================================================================================
@@ -42,14 +45,22 @@ DESCRIPTION = ("Worst-case, RSS and Monte Carlo stack-ups with Cpk and contribut
 MIN_SAMPLES, MAX_SAMPLES = 1_000, 1_000_000
 
 
+NORMAL, UNIFORM, TRIANGULAR = "normal", "uniform", "triangular"
+DISTRIBUTIONS = (NORMAL, UNIFORM, TRIANGULAR)
+
+
 @dataclass(frozen=True)
 class Dim:
-    """One link in the stack. direction=+1 adds to the gap, -1 subtracts from it."""
+    """One link in the stack. direction=+1 adds to the gap, -1 subtracts from it.
+    dist: distribution of the dimension over its tolerance band. shift: how far the process mean sits
+    from the band centre (same length unit as the other fields; positive = the dimension runs larger)."""
     name: str
     nominal: float
     tol_plus: float
     tol_minus: float
     direction: int = 1
+    dist: str = NORMAL
+    shift: float = 0.0
 
 
 def _finite(v, name: str) -> float:
@@ -76,6 +87,9 @@ def validate_dims(dims: Sequence[Dim]) -> list:
         require_non_negative(d.tol_minus, f"{who}: −tolerance")
         if d.direction not in (1, -1):
             raise ValidationError(f"{who}: direction must be +1 or −1.")
+        if d.dist not in DISTRIBUTIONS:
+            raise ValidationError(f"{who}: distribution must be normal, uniform or triangular.")
+        _finite(d.shift, f"{who}: mean shift")
     return dims
 
 
@@ -87,11 +101,15 @@ def _blank(v) -> bool:
 
 
 def rows_to_dims(rows, scale: float = 1.0) -> list:
-    """Table rows (name, direction symbol, nominal, +tol, -tol) in the user's units -> list of Dim in SI.
-    `scale` converts one user length unit to metres. Fully blank rows are skipped."""
+    """Table rows (name, direction symbol, nominal, +tol, -tol[, distribution, mean shift]) in the user's units
+    -> list of Dim in SI. `scale` converts one user length unit to metres. Fully blank rows are skipped;
+    a blank distribution means normal and a blank shift means 0."""
     dims = []
     for i, row in enumerate(rows, start=1):
-        name, sign, nom, tp, tm = row
+        if len(row) not in (5, 7):
+            raise ValidationError(f"Row {i}: expected 5 or 7 columns.")
+        name, sign, nom, tp, tm = row[:5]
+        dist, shift = (row[5], row[6]) if len(row) == 7 else (None, None)
         if all(_blank(v) for v in row):
             continue
         who = f"Row {i}" + (f" ('{name}')" if not _blank(name) else "")
@@ -99,7 +117,11 @@ def rows_to_dims(rows, scale: float = 1.0) -> list:
             raise ValidationError(f"{who}: choose a direction, + or −.")
         nom, tp, tm = (_finite(v, f"{who}: {lab}") * scale
                        for v, lab in ((nom, "nominal size"), (tp, "+tolerance"), (tm, "−tolerance")))
-        dims.append(Dim("" if _blank(name) else str(name), nom, tp, tm, DIRECTIONS[sign]))
+        dist = NORMAL if _blank(dist) else str(dist).strip().lower()
+        if dist not in DISTRIBUTIONS:
+            raise ValidationError(f"{who}: distribution must be normal, uniform or triangular.")
+        shift = 0.0 if _blank(shift) else _finite(shift, f"{who}: mean shift") * scale
+        dims.append(Dim("" if _blank(name) else str(name), nom, tp, tm, DIRECTIONS[sign], dist, shift))
     return dims
 
 
@@ -120,12 +142,30 @@ def worst_case(dims: Sequence[Dim]) -> tuple:
     return lo, hi
 
 
+def half_width(d: Dim) -> float:
+    """t = (+tol + -tol) / 2, the half-width of the tolerance band."""
+    return (d.tol_plus + d.tol_minus) / 2
+
+
+def band_centre(d: Dim) -> float:
+    """Middle of the tolerance band (nominal plus half the difference of the two tolerances)."""
+    return d.nominal + (d.tol_plus - d.tol_minus) / 2
+
+
+def dim_sigma(d: Dim, k: float) -> float:
+    """Standard deviation of one dimension: normal t/k, uniform t/sqrt(3), triangular t/sqrt(6)."""
+    t = half_width(d)
+    if d.dist == UNIFORM:
+        return t / math.sqrt(3)
+    if d.dist == TRIANGULAR:
+        return t / math.sqrt(6)
+    return t / k
+
+
 def dim_stats(d: Dim, k: float) -> tuple:
-    """(mean contribution to the gap, sigma contribution). The tolerance band is taken as ±k·sigma,
-    centred on the middle of the band, so an asymmetric tolerance shifts the mean."""
-    mid = d.nominal + (d.tol_plus - d.tol_minus) / 2
-    sigma = (d.tol_plus + d.tol_minus) / (2 * k)
-    return d.direction * mid, sigma
+    """(mean contribution to the gap, sigma contribution). The distribution is centred on the middle of the band
+    plus the process mean shift, so an asymmetric tolerance or a shift moves the mean."""
+    return d.direction * (band_centre(d) + d.shift), dim_sigma(d, k)
 
 
 def _check_k(k):
@@ -149,7 +189,8 @@ def rss(dims: Sequence[Dim], k: float = 3.0) -> RSSResult:
 
 
 def monte_carlo(dims: Sequence[Dim], k: float = 3.0, n: int = 50_000, seed: int = 1) -> np.ndarray:
-    """Gap samples: every dimension drawn from a normal distribution (not truncated at its limits)."""
+    """Gap samples: each dimension drawn from its own distribution (normal samples are not truncated at the limits;
+    uniform and triangular samples span the tolerance band, moved by the mean shift)."""
     dims, k = validate_dims(dims), _check_k(k)
     if not (MIN_SAMPLES <= n <= MAX_SAMPLES) or int(n) != n:
         raise ValidationError(f"Number of samples must be a whole number between {MIN_SAMPLES:,} and {MAX_SAMPLES:,}.")
@@ -157,7 +198,15 @@ def monte_carlo(dims: Sequence[Dim], k: float = 3.0, n: int = 50_000, seed: int 
     gap = np.zeros(int(n))
     for d in dims:
         mean, sigma = dim_stats(d, k)
-        gap += mean + sigma * rng.standard_normal(int(n)) if sigma > 0 else mean
+        t = half_width(d)
+        if sigma <= 0:
+            gap += mean
+        elif d.dist == UNIFORM:
+            gap += mean + d.direction * t * rng.uniform(-1.0, 1.0, int(n))
+        elif d.dist == TRIANGULAR:
+            gap += mean + d.direction * t * rng.triangular(-1.0, 0.0, 1.0, int(n))
+        else:
+            gap += mean + sigma * rng.standard_normal(int(n))
     return gap
 
 
@@ -181,6 +230,24 @@ def cpk(mean: float, sigma: float, lsl: float, usl: float) -> float:
 def cp(sigma: float, lsl: float, usl: float) -> float:
     lsl, usl = check_spec(lsl, usl)
     return float("inf") if sigma == 0 else (usl - lsl) / (6 * sigma)
+
+
+def normal_ppm(mean: float, sigma: float, lsl: float, usl: float) -> float:
+    """Parts per million outside the spec limits for a normal gap with this mean and sigma (both tails)."""
+    lsl, usl = check_spec(lsl, usl)
+    if sigma < 0:
+        raise ValidationError("Standard deviation cannot be negative.")
+    if sigma == 0:
+        return 0.0 if lsl <= mean <= usl else 1e6
+    root2 = math.sqrt(2.0)
+    p = 0.5 * math.erfc((usl - mean) / (sigma * root2)) + 0.5 * math.erfc((mean - lsl) / (sigma * root2))
+    return 1e6 * p
+
+
+def sigma_level(cpk_value: float) -> float:
+    """Sigma level as the distance from the mean to the nearest spec limit in sigmas (= 3 x Cpk).
+    No 1.5-sigma long-term shift is added."""
+    return 3.0 * cpk_value
 
 
 def fraction_out_of_spec(samples: np.ndarray, lsl: float, usl: float) -> float:
@@ -214,6 +281,11 @@ class StackResult:
     cpk_rss: float
     cpk_mc: float
     cp_rss: float
+    cp_mc: float
+    ppm_rss: float              # normal model on the RSS mean and sigma
+    ppm_mc: float               # counted from the Monte Carlo samples (resolution 1e6 / n)
+    sigma_level_rss: float
+    sigma_level_mc: float
     out_wc: bool                # worst-case range falls outside the spec limits
     out_rss: bool
     frac_out_mc: float
@@ -230,10 +302,124 @@ def analyse_stack(dims: Sequence[Dim], lsl: float, usl: float, k: float = 3.0,
     r = rss(dims, k)
     s = monte_carlo(dims, k, n, seed)
     mu, sd = float(s.mean()), float(s.std(ddof=1))
-    return StackResult(nominal_gap(dims), wc_lo, wc_hi, r, s, mu, sd,
-                       cpk(r.mean, r.sigma, lsl, usl), cpk(mu, sd, lsl, usl), cp(r.sigma, lsl, usl),
+    c_rss, c_mc = cpk(r.mean, r.sigma, lsl, usl), cpk(mu, sd, lsl, usl)
+    frac = fraction_out_of_spec(s, lsl, usl)
+    return StackResult(nominal_gap(dims), wc_lo, wc_hi, r, s, mu, sd, c_rss, c_mc, cp(r.sigma, lsl, usl),
+                       cp(sd, lsl, usl), normal_ppm(r.mean, r.sigma, lsl, usl), frac * 1e6,
+                       sigma_level(c_rss), sigma_level(c_mc),
                        wc_lo < lsl or wc_hi > usl, r.lo < lsl or r.hi > usl,
-                       fraction_out_of_spec(s, lsl, usl), contributions(dims, k), lsl, usl)
+                       frac, contributions(dims, k), lsl, usl)
+
+
+# ---- Tolerance budget solver ------------------------------------------------------------------
+@dataclass(frozen=True)
+class BudgetResult:
+    target: float
+    current_cpk: float          # Cpk (RSS) of the stack as entered
+    feasible: bool             # a tolerance scale factor can reach the target
+    message: str               # why not, when infeasible
+    scale: float               # all half-widths x scale reaches the target Cpk (nan if infeasible)
+    action: str                # "tighten", "loosen", "none" or "" when infeasible
+    rows: pd.DataFrame         # per dimension, SI units
+
+
+def tolerance_budget(dims: Sequence[Dim], lsl: float, usl: float, target: float, k: float = 3.0) -> BudgetResult:
+    """How far the tolerances must change to reach a target Cpk (RSS basis).
+
+    Every sigma is proportional to its band half-width t, so scaling all half-widths about their band centres by s
+    scales sigma_RSS by s and leaves the mean (and any shift) alone:  s = min(USL - mu, mu - LSL) / (3 * target * sigma).
+    For one row alone: sigma_req^2 = (margin / (3 target))^2, f^2 = (sigma_req^2 - (V - v_j)) / v_j, where V = sum of
+    variances and v_j the row's variance; the row's half-width is multiplied by f (not enough alone if the numerator <= 0).
+    """
+    dims, k = validate_dims(dims), _check_k(k)
+    lsl, usl = check_spec(lsl, usl)
+    target = require_positive(_finite(target, "Target Cpk"), "Target Cpk")
+    r = rss(dims, k)
+    cpk_now = cpk(r.mean, r.sigma, lsl, usl)
+    sig = np.array([dim_sigma(d, k) for d in dims])
+    var = sig ** 2
+    t = np.array([half_width(d) for d in dims])
+    cols = {"name": [d.name or f"Row {i}" for i, d in enumerate(dims, start=1)], "half_width": t,
+            "variance_share": var / var.sum() if var.sum() > 0 else np.zeros(len(dims))}
+    margin = min(usl - r.mean, r.mean - lsl)
+    nan_cols = {"half_width_scaled": np.full(len(dims), np.nan), "half_width_alone": np.full(len(dims), np.nan),
+                "factor_alone": np.full(len(dims), np.nan)}
+    if r.sigma <= 0:
+        return BudgetResult(target, cpk_now, False, "All tolerances are zero, so there is nothing to scale.", float("nan"), "",
+                            pd.DataFrame({**cols, **nan_cols}))
+    if margin <= 0:
+        return BudgetResult(target, cpk_now, False, "The mean gap is outside the spec limits, so no tolerance change can reach "
+                            "the target. Re-centre the stack first (nominal sizes or mean shift).", float("nan"), "",
+                            pd.DataFrame({**cols, **nan_cols}))
+    sigma_req = margin / (3.0 * target)
+    scale = sigma_req / r.sigma
+    f2 = np.full(len(dims), np.nan)
+    ok = var > 0
+    f2[ok] = (sigma_req ** 2 - (var.sum() - var[ok])) / var[ok]
+    factor = np.where(f2 > 0, np.sqrt(np.where(f2 > 0, f2, 1.0)), np.nan)
+    cols.update(half_width_scaled=t * scale, half_width_alone=t * factor, factor_alone=factor)
+    action = "none" if abs(scale - 1.0) < 1e-9 else ("tighten" if scale < 1 else "loosen")
+    df = pd.DataFrame(cols)
+    return BudgetResult(target, cpk_now, True, "", float(scale), action, df)
+
+
+# ---- Results table (also the CSV) -------------------------------------------------------------
+RESULT_COLUMNS = ["Method", "Min gap", "Max gap", "Mean", "Sigma", "Cp", "Cpk", "ppm out of spec", "Sigma level", "Inside spec"]
+
+
+def results_table(res: StackResult, unit_label: str, metres_per_unit: float = 1e-3) -> pd.DataFrame:
+    """One row per method. Lengths are shown in the user's unit (`metres_per_unit` converts that unit to metres).
+    Worst-case has only limits; blank cells are None. Column names are plain ASCII so the CSV opens cleanly."""
+    L = lambda v: v / metres_per_unit
+    u = f" ({unit_label})"
+    mc_lo, mc_hi = float(res.samples.min()), float(res.samples.max())
+    rows = [
+        ["Worst-case", L(res.wc_lo), L(res.wc_hi), None, None, None, None, None, None, not res.out_wc],
+        ["RSS (mean +/- k sigma)", L(res.rss.lo), L(res.rss.hi), L(res.rss.mean), L(res.rss.sigma), res.cp_rss,
+         res.cpk_rss, res.ppm_rss, res.sigma_level_rss, not res.out_rss],
+        ["Monte Carlo", L(mc_lo), L(mc_hi), L(res.mc_mean),
+         L(res.mc_sigma), res.cp_mc, res.cpk_mc, res.ppm_mc, res.sigma_level_mc, res.lsl <= mc_lo and mc_hi <= res.usl],
+    ]
+    cols = [c + u if c in ("Min gap", "Max gap", "Mean", "Sigma") else c for c in RESULT_COLUMNS]
+    return pd.DataFrame(rows, columns=cols)
+
+
+def results_csv(res: StackResult, unit_label: str, metres_per_unit: float = 1e-3) -> bytes:
+    return results_table(res, unit_label, metres_per_unit).to_csv(index=False).encode("utf-8")
+
+
+# ---- Example stacks (illustrative; sizes in mm) -----------------------------------------------
+# rows: (name, direction, nominal, +tol, -tol, distribution, mean shift)    spec: (LSL, USL) of the gap, mm
+EXAMPLES = {
+    "Housing + 3 parts (default)": {
+        "rows": [("Housing", "+", 100.0, 0.10, 0.10, NORMAL, 0.0), ("Part A", "−", 40.0, 0.05, 0.05, NORMAL, 0.0),
+                 ("Part B", "−", 30.0, 0.05, 0.05, NORMAL, 0.0), ("Part C", "−", 25.0, 0.05, 0.05, NORMAL, 0.0)],
+        "spec": (4.8, 5.2), "note": "Gap = housing − parts A, B and C."},
+    "Shaft / bearing / housing end float": {
+        "rows": [("Housing bore depth", "+", 60.0, 0.15, 0.15, NORMAL, 0.02), ("Bearing A width", "−", 18.0, 0.0, 0.12, NORMAL, 0.0),
+                 ("Bearing B width", "−", 18.0, 0.0, 0.12, NORMAL, 0.0), ("Spacer", "−", 23.5, 0.05, 0.05, UNIFORM, 0.0)],
+        "spec": (0.30, 0.90), "note": "Axial end float = housing bore depth − two bearing widths − spacer. "
+                                      "The housing runs 0.02 mm large (mean shift)."},
+    "Pin in hole (clearance)": {
+        "rows": [("Hole diameter", "+", 10.0, 0.015, 0.0, TRIANGULAR, 0.0), ("Pin diameter", "−", 9.99, 0.005, 0.004, NORMAL, 0.0)],
+        "spec": (0.004, 0.030), "note": "Radial clearance as diametral gap = hole − pin (hole triangular, pin normal)."},
+    "Shim stack": {
+        "rows": [("Housing depth", "+", 45.0, 0.10, 0.10, NORMAL, 0.0), ("Gear width", "−", 20.0, 0.05, 0.05, NORMAL, 0.0),
+                 ("Bearing width", "−", 12.0, 0.0, 0.10, NORMAL, 0.0), ("Spacer ring", "−", 11.2, 0.05, 0.05, NORMAL, -0.02),
+                 ("Shim A", "−", 0.75, 0.01, 0.01, UNIFORM, 0.0), ("Shim B", "−", 0.75, 0.01, 0.01, UNIFORM, 0.0)],
+        "spec": (0.10, 0.50), "note": "Axial gap under the cover = housing − gear − bearing − spacer − two shims "
+                                      "(shim stock uniform, spacer ring runs 0.02 mm small)."},
+}
+DEFAULT_EXAMPLE = next(iter(EXAMPLES))
+
+
+def example_dims(name: str) -> tuple:
+    """(dims in SI, lsl, usl in SI) of an example stack."""
+    if name not in EXAMPLES:
+        raise ValidationError(f"Unknown example stack '{name}'.")
+    ex = EXAMPLES[name]
+    rows = [(n, sg, nom, tp, tm, dist, sh) for n, sg, nom, tp, tm, dist, sh in ex["rows"]]
+    return rows_to_dims(rows, 1e-3), ex["spec"][0] * 1e-3, ex["spec"][1] * 1e-3
 
 
 # ---- GD&T position (hole or pin) -------------------------------------------------------------
@@ -331,7 +517,7 @@ def histogram_figure(res: StackResult, k: float, system) -> go.Figure:
         xs = np.linspace(xmin - pad, xmax + pad, 400)
         pdf = np.exp(-0.5 * ((xs - mu) / sd) ** 2) / (sd * math.sqrt(2 * math.pi))
         fig.add_trace(go.Scatter(x=xs, y=pdf, mode="lines", line=dict(color="#111", width=1.5),
-                                 name="Normal curve (RSS mean, σ)", hoverinfo="skip"))
+                                 name="Normal approximation (RSS mean, σ)", hoverinfo="skip"))
         ymax = max(ymax, float(pdf.max()) * 1.1)
     for pair, colour, dash, name in ((wc, GREY, "dot", "Worst-case limits"),
                                      (rs, AMBER, "dot", f"RSS limits (±{k:g}σ)"),
@@ -416,19 +602,24 @@ def bonus_figure(g: GdtResult, feature, size_min, size_max, actual, pos_tol, sys
 # =============================================================================================
 # UI
 # =============================================================================================
-ILLUSTRATIVE = [Dim("Housing", 100e-3, 0.10e-3, 0.10e-3, +1), Dim("Part A", 40e-3, 0.05e-3, 0.05e-3, -1),
-                Dim("Part B", 30e-3, 0.05e-3, 0.05e-3, -1), Dim("Part C", 25e-3, 0.05e-3, 0.05e-3, -1)]
-
-
 def _columns(system):
     u = units.label("length", system)
-    return ["Name", "Dir", f"Nominal ({u})", f"+Tol ({u})", f"−Tol ({u})"]
+    return ["Name", "Dir", f"Nominal ({u})", f"+Tol ({u})", f"−Tol ({u})", "Distribution", f"Mean shift ({u})"]
 
 
-def _default_df(system) -> pd.DataFrame:
-    r = lambda v: round(_L(v, system), 6)
-    return pd.DataFrame([[d.name, "+" if d.direction == 1 else "−", r(d.nominal), r(d.tol_plus), r(d.tol_minus)]
-                         for d in ILLUSTRATIVE], columns=_columns(system))
+def _example_df(name, system) -> pd.DataFrame:
+    r = lambda v: round(v * 1e-3 / units.to_si(1.0, "length", system), 10)    # example sizes are written in mm
+    rows = [[n, sg, r(nom), r(tp), r(tm), dist, r(sh)] for n, sg, nom, tp, tm, dist, sh in EXAMPLES[name]["rows"]]
+    return pd.DataFrame(rows, columns=_columns(system))
+
+
+def _ekey(base, example, system):
+    """Widget key; the default example keeps the plain key, every other example gets its own so its inputs reset."""
+    return f"{base}_{system}" if example == DEFAULT_EXAMPLE else f"{base}_{list(EXAMPLES).index(example)}_{system}"
+
+
+def _nfmt(system):
+    return "%.4f" if system == units.SI else "%.6f"
 
 
 def _step(system):
@@ -459,22 +650,70 @@ def _guard(fn, system):
         st.error(f"Input problem: {e}")
 
 
+def _fmt_cell(v, digits=2):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    return "∞" if not np.isfinite(v) else f"{v:.{digits}f}"
+
+
+def _fmt_ppm(v):
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    return f"{v:.1f}" if v < 1000 else f"{v:,.0f}"
+
+
+def _render_budget(dims, lsl, usl, k, system) -> None:
+    u = units.label("length", system)
+    st.subheader("Tolerance budget solver")
+    target = st.number_input("Target Cpk (RSS)", min_value=0.1, max_value=5.0, value=1.33, step=0.01, format="%.2f", key="ts_target")
+    b = tolerance_budget(dims, lsl, usl, target, k)
+    if not b.feasible:
+        st.warning(b.message)
+        return
+    top = b.rows.sort_values("variance_share", ascending=False, kind="stable").iloc[0]
+    if b.action == "none":
+        st.success(f"Cpk (RSS) is {_cpk_text(b.current_cpk)}: the tolerances already sit at the target.")
+    elif b.action == "tighten":
+        st.error(f"Cpk (RSS) is {_cpk_text(b.current_cpk)}, below the target {target:g}. Tighten every tolerance to "
+                 f"**{b.scale * 100:.1f} %** of its present width (× {b.scale:.3f}). Tighten first: **{top['name']}**, the largest "
+                 f"contributor ({top['variance_share'] * 100:.1f} % of the variance).")
+    else:
+        st.success(f"Cpk (RSS) is {_cpk_text(b.current_cpk)}, above the target {target:g}. Every tolerance may widen to "
+                   f"**{b.scale * 100:.1f} %** of its present width (× {b.scale:.3f}) before Cpk falls to the target.")
+    d = 4 if system == units.SI else 6
+    h = lambda v: _fmt_cell(_L(v, system) if np.isfinite(v) else v, d)
+    rows = b.rows
+    out = pd.DataFrame({
+        "Dimension": rows["name"],
+        f"Half-width now (± {u})": [h(v) for v in rows["half_width"]],
+        f"Half-width if all scaled (± {u})": [h(v) for v in rows["half_width_scaled"]],
+        f"Half-width if only this row changes (± {u})": [h(v) if np.isfinite(v) else "not enough alone" for v in rows["half_width_alone"]],
+        "Share of variance": [f"{v * 100:.1f} %" for v in rows["variance_share"]]})
+    st.dataframe(out, hide_index=True, width="stretch")
+    st.caption("Scaling keeps each band's centre and any mean shift fixed. The mean gap and the spec limits decide the "
+               "target: if the mean is off-centre, re-centre the stack first.")
+
+
 def _render_stack(system) -> None:
     u = units.label("length", system)
-    st.caption("Illustrative example values, not from a real project. Edit any cell; use the + row at the bottom "
-               "to add a dimension. Dir: + adds to the gap, − subtracts from it.")
+    example = st.selectbox("Example stack (loads into the table below)", list(EXAMPLES), key="ts_example")
+    st.caption(f"Illustrative example values, not from a real project. {EXAMPLES[example]['note']} Edit any cell; use the + row "
+               "at the bottom to add a dimension. Dir: + adds to the gap, − subtracts from it. Mean shift moves the process "
+               "mean away from the middle of the tolerance band.")
     cols = _columns(system)
     cfg = {cols[0]: st.column_config.TextColumn(),
            cols[1]: st.column_config.SelectboxColumn(options=["+", "−"], width="small"),
-           **{c: st.column_config.NumberColumn(format="%.4f") for c in cols[2:]}}
-    edited = st.data_editor(_default_df(system), num_rows="dynamic", hide_index=True, width="stretch",
-                            column_config=cfg, key=f"ts_table_{system}")
+           cols[5]: st.column_config.SelectboxColumn(options=list(DISTRIBUTIONS), width="small"),
+           **{c: st.column_config.NumberColumn(format=_nfmt(system)) for c in cols[2:5] + cols[6:]}}
+    edited = st.data_editor(_example_df(example, system), num_rows="dynamic", hide_index=True, width="stretch",
+                            column_config=cfg, key=_ekey("ts_table", example, system))
     c1, c2, c3 = st.columns(3)
-    lsl = units.to_si(c1.number_input(f"Lower spec limit of the gap ({u})", value=float(_L(4.8e-3, system)),
-                                      step=_step(system), format="%.4f", key=f"ts_lsl_{system}"), "length", system)
-    usl = units.to_si(c2.number_input(f"Upper spec limit of the gap ({u})", value=float(_L(5.2e-3, system)),
-                                      step=_step(system), format="%.4f", key=f"ts_usl_{system}"), "length", system)
-    k = c3.slider("Sigma multiplier k (tolerance = ±k·σ)", 2.0, 6.0, 3.0, 0.5, key="ts_k")
+    spec_lo, spec_hi = (v * 1e-3 for v in EXAMPLES[example]["spec"])
+    lsl = units.to_si(c1.number_input(f"Lower spec limit of the gap ({u})", value=float(_L(spec_lo, system)),
+                                      step=_step(system), format=_nfmt(system), key=_ekey("ts_lsl", example, system)), "length", system)
+    usl = units.to_si(c2.number_input(f"Upper spec limit of the gap ({u})", value=float(_L(spec_hi, system)),
+                                      step=_step(system), format=_nfmt(system), key=_ekey("ts_usl", example, system)), "length", system)
+    k = c3.slider("Sigma multiplier k (normal rows: tolerance = ±k·σ)", 2.0, 6.0, 3.0, 0.5, key="ts_k")
 
     dims = rows_to_dims(edited.itertuples(index=False, name=None), units.to_si(1.0, "length", system))
     res = analyse_stack(dims, lsl, usl, k, N_SAMPLES, SEED)
@@ -483,40 +722,55 @@ def _render_stack(system) -> None:
         st.success("Worst-case stack is inside the spec limits: every assembly passes if all parts are within tolerance.")
     elif not res.out_rss:
         st.warning("Worst-case exceeds the spec limits but RSS is inside them. Acceptable only if the statistical "
-                   "assumptions hold (independent, roughly normal, centred processes).")
+                   "assumptions hold (independent dimensions, a roughly normal gap, processes running where the table says).")
     else:
         st.error("Even the RSS range exceeds the spec limits: expect a real fraction of assemblies out of spec.")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Nominal gap", units.fmt(res.nominal, "length", system, 4))
-    m2.metric("Cpk (RSS)", _cpk_text(res.cpk_rss))
-    m3.metric("Cpk (Monte Carlo)", _cpk_text(res.cpk_mc))
-    m4.metric("Out of spec (Monte Carlo)", f"{res.frac_out_mc * 100:.2f} %")
+    m2.metric("Cp (RSS)", _cpk_text(res.cp_rss))
+    m3.metric("Cpk (RSS)", _cpk_text(res.cpk_rss))
+    m4.metric("Cpk (Monte Carlo)", _cpk_text(res.cpk_mc))
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Sigma level (3 × Cpk, RSS)", _cpk_text(res.sigma_level_rss),
+              help="Distance from the mean to the nearest spec limit in sigmas. No 1.5σ long-term shift is added.")
+    m6.metric("ppm out (RSS, normal)", _fmt_ppm(res.ppm_rss),
+              help="Normal-model estimate from the RSS mean and σ. Approximate when the gap is not close to normal.")
+    m7.metric("Out of spec (Monte Carlo)", f"{res.frac_out_mc * 100:.2f} %")
+    m8.metric("ppm out (Monte Carlo)",
+              f"{res.ppm_mc:,.0f}" if res.ppm_mc > 0 else f"< {1e6 / len(res.samples):,.0f}",
+              help="Counted from the samples; resolves only about 1 in 50,000.")
 
     st.plotly_chart(histogram_figure(res, k, system), width="stretch")
 
-    f = lambda v: f"{_L(v, system):.4f}"
-    mc_lo, mc_hi = float(res.samples.min()), float(res.samples.max())
-    rows = [("Worst-case", res.wc_lo, res.wc_hi, not res.out_wc),
-            (f"RSS (mean ± {k:g}σ)", res.rss.lo, res.rss.hi, not res.out_rss),
-            (f"Monte Carlo (observed min / max of {N_SAMPLES:,})", mc_lo, mc_hi, res.lsl <= mc_lo and mc_hi <= res.usl)]
-    left, right = st.columns(2, gap="large")
-    left.dataframe(pd.DataFrame({"Method": [r[0] for r in rows], f"Min gap ({u})": [f(r[1]) for r in rows],
-                                 f"Max gap ({u})": [f(r[2]) for r in rows],
-                                 "Inside spec": ["Yes" if r[3] else "No" for r in rows]}),
-                   hide_index=True, width="stretch")
+    tbl = results_table(res, u, units.to_si(1.0, "length", system))
+    shown = tbl.copy()
+    for c in shown.columns[1:5]:
+        shown[c] = [_fmt_cell(v, 4 if system == units.SI else 6) for v in shown[c]]
+    for c in ("Cp", "Cpk", "Sigma level"):
+        shown[c] = [_fmt_cell(v) for v in shown[c]]
+    shown["ppm out of spec"] = [_fmt_ppm(v) for v in shown["ppm out of spec"]]
+    shown["Inside spec"] = ["Yes" if v else "No" for v in tbl["Inside spec"]]
+    st.dataframe(shown, hide_index=True, width="stretch")
+    st.caption(f"Monte Carlo min and max are the smallest and largest of {len(res.samples):,} samples. Cp, Cpk and sigma level use each method's mean and σ.")
+    st.download_button("Download results (CSV)", data=results_csv(res, u, units.to_si(1.0, "length", system)),
+                       file_name="tolerance_stack_results.csv", mime="text/csv", key="ts_csv")
     top = res.contrib.iloc[0]
-    left.caption(f"Largest contributor: **{top['name'] or 'Row 1'}** ({top['variance_share'] * 100:.1f} % of the variance). "
-                 "Tightening it improves Cpk the most.")
-    right.plotly_chart(contribution_figure(res), width="stretch")
+    st.caption(f"Largest contributor: **{top['name'] or 'Row 1'}** ({top['variance_share'] * 100:.1f} % of the variance). "
+               "Tightening it improves Cpk the most.")
+    st.plotly_chart(contribution_figure(res), width="stretch")
+    _render_budget(dims, lsl, usl, k, system)
     with st.expander("Method and limits"):
         st.markdown(
-            "- One-dimensional, linear stack: gap = Σ (±) dimension. Worst-case puts every dimension at its own limit.\n"
-            "- RSS and Monte Carlo treat each tolerance band as ±k·σ of a **normal** distribution centred on the middle of the "
-            "band (an asymmetric tolerance shifts the mean). RSS limits = mean ± k·√Σσ²; Cpk = min(USL − μ, μ − LSL) / 3σ.\n"
-            "- Monte Carlo draws 50,000 gaps with a fixed seed. Samples are **not** truncated at the tolerance limits, and it "
-            "resolves only about 1 in 50,000 (0.002 %); for rarer events rely on Cpk.\n"
-            "- Not modelled: process drift or shift, correlated dimensions, non-normal distributions, assembly "
-            "geometry (angles, 2D/3D stacks), thermal or elastic effects.")
+            "- One-dimensional, linear stack: gap = Σ (±) dimension. Worst-case puts every dimension at its own limit and ignores any mean shift.\n"
+            "- Each row has a distribution over its tolerance band (half-width t, centred on the middle of the band plus the mean shift): "
+            "normal σ = t/k, uniform σ = t/√3, triangular σ = t/√6. RSS limits = mean ± k·√Σσ²; Cp = (USL − LSL)/6σ; "
+            "Cpk = min(USL − μ, μ − LSL)/3σ; sigma level = 3·Cpk (no 1.5σ shift added).\n"
+            "- ppm out of spec (RSS) is a normal-model estimate from the RSS mean and σ; it is only approximate when the gap is far from normal "
+            "(few rows, mostly uniform). Monte Carlo draws 50,000 gaps with a fixed seed from each row's own distribution (normal samples are "
+            "**not** truncated) and resolves only about 1 in 50,000 (20 ppm); for rarer events rely on Cpk.\n"
+            "- Budget solver: all σ scale with the band half-widths, so one factor s = min(USL − μ, μ − LSL)/(3·target·σ) brings Cpk (RSS) to the "
+            "target, with each band's centre and the mean shifts held fixed. The single-row column gives the half-width that row alone would need.\n"
+            "- Not modelled: correlated dimensions, process drift over time, assembly geometry (angles, 2D/3D stacks), thermal or elastic effects.")
 
 
 def _render_gdt(system) -> None:
