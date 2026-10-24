@@ -18,7 +18,7 @@ def test_chapter_loads_standalone_with_disclaimer_and_both_tabs():
     at = _run()
     assert not at.exception
     assert any("not certified design" in w.value for w in at.warning)
-    assert len(at.tabs) == 2 and len(at.metric) == 12
+    assert len(at.tabs) == 2 and len(at.metric) == 14
     assert at.metric[0].value == units.fmt(5e-3, "length", "SI", 4)
     assert any("RSS is inside" in w.value for w in at.warning)          # default stack: worst-case 4.75-5.25 vs spec 4.8-5.2
     assert any("PASS" in s.value for s in at.success)                   # default GD&T hole passes with bonus
@@ -99,3 +99,47 @@ def test_budget_message_when_mean_is_outside_spec():
     at = _run()
     at.number_input(key="ts_usl_SI").set_value(4.9).run()                # mean 5.0 above USL 4.9, LSL 4.8 still valid
     assert not at.exception and any("outside the spec limits" in w.value for w in at.warning)
+
+
+def _metric(at, label):
+    return next(m for m in at.metric if m.label == label)
+
+
+def test_modifier_radio_has_mmc_lmc_rfs_and_lmc_fails_default_hole():
+    at = _run()
+    assert list(at.radio(key="ts_g_mod").options) == ["At MMC (bonus allowed)", "At LMC (bonus allowed)", "RFS (no bonus)"]
+    assert any("PASS" in s.value for s in at.success)                       # default hole at MMC: zone 0.35 >= 0.3124
+    at.radio(key="ts_g_mod").set_value(ts.LMC).run()
+    assert not at.exception
+    assert _metric(at, "Bonus tolerance").value == units.fmt(0.05e-3, "length", "SI", 4)      # 10.20 - 10.15
+    assert _metric(at, "Allowed zone Ø").value == units.fmt(0.25e-3, "length", "SI", 4)
+    assert _metric(at, "Virtual condition").value == units.fmt(10.4e-3, "length", "SI", 4)    # LMC + tol
+    assert any("FAIL: measured position" in e.value for e in at.error)
+
+
+def test_pin_at_lmc_in_us_units_runs():
+    at = _run()
+    at.radio(key="ts_g_feature").set_value(ts.PIN).run()
+    at.radio(key="ts_g_mod").set_value(ts.LMC).run()
+    assert _metric(at, "Bonus tolerance").value == units.fmt(0.02e-3, "length", "SI", 4)      # 9.92 - 9.90
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception
+    assert _metric(at, "Virtual condition").value == units.fmt(9.8e-3, "length", "US", 4)      # LMC - tol
+
+
+def test_fastener_panel_floating_fixed_and_us():
+    at = _run()
+    assert _metric(at, "Clearance H − F").value == units.fmt(0.4e-3, "length", "SI", 4)
+    assert _metric(at, "Position tolerance Ø per part (T)").value == units.fmt(0.4e-3, "length", "SI", 4)
+    at.radio(key="ts_f_kind").set_value(ts.FIXED).run()
+    assert _metric(at, "Position tolerance Ø per part (T)").value == units.fmt(0.2e-3, "length", "SI", 4)
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception
+    assert _metric(at, "Position tolerance Ø per part (T)").value == units.fmt(0.2e-3, "length", "US", 4)
+
+
+def test_fastener_larger_than_hole_shows_input_problem_not_crash():
+    at = _run()
+    at.number_input(key="ts_f_fast_SI").set_value(9.0).run()                  # hole 8.4 < fastener 9.0
+    assert not at.exception
+    assert any("no clearance" in e.value for e in at.error)

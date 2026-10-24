@@ -203,7 +203,7 @@ def test_bad_gdt_inputs_raise(args):
 
 def test_bad_modifier_raises():
     with pytest.raises(ValidationError):
-        ts.gdt_position(ts.HOLE, 10.0, 10.2, 10.1, 0.2, 0, 0, modifier="LMC")
+        ts.gdt_position(ts.HOLE, 10.0, 10.2, 10.1, 0.2, 0, 0, modifier="XYZ")
 
 
 # ---- table rows -> dims ----------------------------------------------------------------------

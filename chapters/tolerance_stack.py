@@ -4,7 +4,7 @@ Learning tool based on ASME Y14.5 concepts; NOT a certified interpretation of th
 Size stack-up (one-dimensional, linear): worst-case, RSS (root-sum-square) and Monte Carlo, with a normal,
 uniform or triangular distribution and an optional mean shift per dimension, Cp/Cpk/ppm/sigma level, and a
 tolerance budget solver for a target Cpk.
-GD&T: position tolerance zone with bonus tolerance at MMC (or RFS, no bonus) for a hole or pin.
+GD&T: position tolerance zone with bonus tolerance at MMC or LMC (or RFS, no bonus) for a hole or pin, plus the fastener formula (floating and fixed).
 No FEA/CFD of any kind; the Monte Carlo is plain random sampling of the dimension distributions.
 """
 import sys
@@ -28,16 +28,16 @@ from common.validation import ValidationError, require_in_range, require_non_neg
 
 TITLE = "3 · Tolerance stack-up & GD&T"
 KEY_PREFIX = "ts_"
-ABOUT = """**Method.** One-dimensional tolerance stacks compared three ways: worst-case, RSS (√Σσ²) and Monte Carlo. Each row has a distribution: normal (tolerance = ±kσ, k selectable), uniform (σ² = t²/3) or triangular (σ² = t²/6), where t is the half-width of the band. An optional mean shift moves a dimension's process mean away from the band centre. Cp, Cpk, estimated ppm out of spec, sigma level (3·Cpk), each dimension's contribution and a tolerance budget solver (scale factor to reach a target Cpk) are shown. Example stacks can be loaded into the table; the results table downloads as CSV. The GD&T tab draws a position tolerance zone with bonus tolerance at MMC and compares it with RFS. It is a learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.
+ABOUT = """**Method.** One-dimensional tolerance stacks compared three ways: worst-case, RSS (√Σσ²) and Monte Carlo. Each row has a distribution: normal (tolerance = ±kσ, k selectable), uniform (σ² = t²/3) or triangular (σ² = t²/6), where t is the half-width of the band. An optional mean shift moves a dimension's process mean away from the band centre. Cp, Cpk, estimated ppm out of spec, sigma level (3·Cpk), each dimension's contribution and a tolerance budget solver (scale factor to reach a target Cpk) are shown. Example stacks can be loaded into the table; the results table downloads as CSV. The GD&T tab draws a position tolerance zone with bonus tolerance at MMC or LMC and compares it with RFS, and has a fastener formula calculator (floating T = H − F, fixed T = (H − F)/2 per part, from hole and fastener sizes at MMC). It is a learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.
 
 **Checked in pytest:** worst-case, RSS and Cpk against hand values; the three distribution variances; mean shift; Monte Carlo against the analytic mean, σ and tail fraction (fixed seed); Cp, ppm and sigma level; the budget scale factor and its round trip; example stacks; CSV contents; asymmetric tolerances; contribution shares; bonus tolerance, zone and virtual condition; RFS; boundary cases.
 
-**Limitations:** 1D linear stacks, no correlation between dimensions. Cpk and ppm from RSS assume the summed gap is roughly normal. GD&T covers one feature with one position zone (no datum frames, composite or projected zones, orientation or form controls, LMC).
+**Limitations:** 1D linear stacks, no correlation between dimensions. Cpk and ppm from RSS assume the summed gap is roughly normal. GD&T covers one feature with one position zone (no datum frames, composite or projected zones, orientation or form controls). The fixed-fastener formula assumes the fixed fastener's perpendicularity is controlled; a projected tolerance zone is not modelled.
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Worst-case, RSS and Monte Carlo stack-ups (normal, uniform or triangular rows) with Cp, Cpk, ppm, a "
                "tolerance budget solver and contribution ranking, plus a "
-               "GD&T position tolerance zone with bonus tolerance at MMC (learning tool, ASME Y14.5 concepts).")
+               "GD&T position tolerance zone with bonus tolerance at MMC or LMC and a fastener formula (learning tool, ASME Y14.5 concepts).")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
@@ -424,7 +424,8 @@ def example_dims(name: str) -> tuple:
 
 # ---- GD&T position (hole or pin) -------------------------------------------------------------
 HOLE, PIN = "hole", "pin"
-MMC, RFS = "MMC", "RFS"
+MMC, LMC, RFS = "MMC", "LMC", "RFS"
+FLOATING, FIXED = "floating", "fixed"
 
 
 @dataclass(frozen=True)
@@ -439,6 +440,7 @@ class GdtResult:
     virtual_condition: float
     passed: bool
     passed_rfs: bool        # same part judged without any bonus, for comparison
+    lmc_size: float = 0.0   # least material condition size (hole: maximum size, pin: minimum size)
 
 
 def position_offset_diameter(dx: float, dy: float) -> float:
@@ -446,15 +448,24 @@ def position_offset_diameter(dx: float, dy: float) -> float:
     return 2.0 * math.hypot(_finite(dx, "Offset x"), _finite(dy, "Offset y"))
 
 
+def _raw_bonus(feature, modifier, size_min, size_max, actual):
+    """Size departure from the modifier's condition (before clipping to the size range)."""
+    if modifier == LMC:
+        return size_max - actual if feature == HOLE else actual - size_min
+    return actual - size_min if feature == HOLE else size_max - actual
+
+
 def gdt_position(feature: str, size_min: float, size_max: float, actual: float, pos_tol: float,
                  dx: float, dy: float, modifier: str = MMC) -> GdtResult:
     """Position tolerance zone for a hole (internal) or pin (external) feature of size.
-    Hole: MMC = smallest size, bonus = actual - size_min.  Pin: MMC = largest size, bonus = size_max - actual.
-    VC (virtual condition) = MMC -/+ position tolerance (hole minus, pin plus). RFS gives no bonus."""
+    MMC: hole bonus = actual - size_min, pin bonus = size_max - actual.
+    LMC: hole bonus = size_max - actual, pin bonus = actual - size_min (the opposite end of the size range).
+    RFS gives no bonus. Virtual condition: MMC -/+ tolerance (hole minus, pin plus) for MMC and RFS;
+    for LMC, LMC +/- tolerance (hole plus, pin minus)."""
     if feature not in (HOLE, PIN):
         raise ValidationError("Feature must be a hole or a pin.")
-    if modifier not in (MMC, RFS):
-        raise ValidationError("Modifier must be MMC or RFS.")
+    if modifier not in (MMC, LMC, RFS):
+        raise ValidationError("Modifier must be MMC, LMC or RFS.")
     for v, lab in ((size_min, "Minimum size"), (size_max, "Maximum size"), (actual, "Actual size"),
                    (pos_tol, "Position tolerance")):
         _finite(v, lab)
@@ -467,22 +478,52 @@ def gdt_position(feature: str, size_min: float, size_max: float, actual: float, 
     measured = position_offset_diameter(dx, dy)
 
     size_ok = size_min <= actual <= size_max
-    raw = actual - size_min if feature == HOLE else size_max - actual
-    bonus = float(np.clip(raw, 0.0, size_max - size_min)) if modifier == MMC else 0.0
+    raw = _raw_bonus(feature, modifier, size_min, size_max, actual)
+    bonus = float(np.clip(raw, 0.0, size_max - size_min)) if modifier in (MMC, LMC) else 0.0
     mmc_size = size_min if feature == HOLE else size_max
-    vc = mmc_size - pos_tol if feature == HOLE else mmc_size + pos_tol
+    lmc_size = size_max if feature == HOLE else size_min
+    if modifier == LMC:
+        vc = lmc_size + pos_tol if feature == HOLE else lmc_size - pos_tol
+    else:
+        vc = mmc_size - pos_tol if feature == HOLE else mmc_size + pos_tol
     zone = pos_tol + bonus
     eps = 1e-12
     return GdtResult(feature, modifier, mmc_size, size_ok, bonus, zone, measured, vc,
-                     size_ok and measured <= zone + eps, size_ok and measured <= pos_tol + eps)
+                     size_ok and measured <= zone + eps, size_ok and measured <= pos_tol + eps, lmc_size)
 
 
-def bonus_curve(feature: str, size_min: float, size_max: float, pos_tol: float, n: int = 50) -> tuple:
-    """(sizes, allowed zone diameters) across the size range, for the bonus-vs-size chart."""
-    gdt_position(feature, size_min, size_max, size_min, pos_tol, 0.0, 0.0)   # validates inputs
+def bonus_curve(feature: str, size_min: float, size_max: float, pos_tol: float, n: int = 50,
+                modifier: str = MMC) -> tuple:
+    """(sizes, allowed zone diameters) across the size range, for the bonus-vs-size chart (MMC or LMC)."""
+    gdt_position(feature, size_min, size_max, size_min, pos_tol, 0.0, 0.0, modifier)   # validates inputs
     sizes = np.linspace(size_min, size_max, n)
-    bonus = sizes - size_min if feature == HOLE else size_max - sizes
+    bonus = _raw_bonus(feature, LMC if modifier == LMC else MMC, size_min, size_max, sizes)
     return sizes, pos_tol + bonus
+
+
+# ---- Fastener formula (hole and fastener sizes at MMC) ----------------------------------------
+@dataclass(frozen=True)
+class FastenerResult:
+    kind: str
+    hole_mmc: float          # H: smallest clearance hole
+    fastener_mmc: float      # F: largest fastener (threaded: maximum major diameter)
+    clearance: float         # H - F
+    tol_per_part: float      # position tolerance Ø to give each part
+
+
+def fastener_position_tolerance(hole_mmc: float, fastener_mmc: float, kind: str = FLOATING) -> FastenerResult:
+    """Floating fastener (clearance holes in all parts): T = H - F for each part.
+    Fixed fastener (fixed in one part, clearance hole in the other): T = (H - F) / 2 for each part.
+    Both parts are assumed to get the same T. H and F are the MMC sizes (smallest hole, largest fastener)."""
+    if kind not in (FLOATING, FIXED):
+        raise ValidationError("Fastener type must be floating or fixed.")
+    h = require_positive(_finite(hole_mmc, "Hole size at MMC"), "Hole size at MMC")
+    f = require_positive(_finite(fastener_mmc, "Fastener size at MMC"), "Fastener size at MMC")
+    if h < f:
+        raise ValidationError("The fastener is larger than the hole at MMC, so there is no clearance and no position "
+                              "tolerance can be given. Check the sizes.")
+    c = h - f
+    return FastenerResult(kind, h, f, c, c if kind == FLOATING else c / 2.0)
 
 
 # =============================================================================================
@@ -582,7 +623,7 @@ def zone_figure(g: GdtResult, pos_tol: float, dx: float, dy: float, system) -> g
 
 def bonus_figure(g: GdtResult, feature, size_min, size_max, actual, pos_tol, system) -> go.Figure:
     u = units.label("length", system)
-    sizes, zone = bonus_curve(feature, size_min, size_max, pos_tol)
+    sizes, zone = bonus_curve(feature, size_min, size_max, pos_tol, modifier=LMC if g.modifier == LMC else MMC)
     if g.modifier == RFS:
         zone = np.full_like(zone, pos_tol)
     fig = go.Figure(go.Scatter(x=_L(sizes, system), y=_L(zone, system), mode="lines",
@@ -775,13 +816,14 @@ def _render_stack(system) -> None:
 
 def _render_gdt(system) -> None:
     u = units.label("length", system)
-    st.caption("Learning tool based on ASME Y14.5 concepts (position tolerance, MMC bonus tolerance); not a certified "
+    st.caption("Learning tool based on ASME Y14.5 concepts (position tolerance, MMC and LMC bonus tolerance); not a certified "
                "interpretation of the standard. Illustrative example values, not from a real project.")
     left, right = st.columns([1, 2], gap="large")
     with left:
         feature = st.radio("Feature of size", [HOLE, PIN], format_func=str.capitalize, horizontal=True, key="ts_g_feature")
-        modifier = st.radio("Position tolerance modifier", [MMC, RFS], horizontal=True, key="ts_g_mod",
-                            format_func=lambda m: "At MMC (bonus allowed)" if m == MMC else "RFS (no bonus)")
+        modifier = st.radio("Position tolerance modifier", [MMC, LMC, RFS], horizontal=True, key="ts_g_mod",
+                            format_func=lambda m: {MMC: "At MMC (bonus allowed)", LMC: "At LMC (bonus allowed)",
+                                                   RFS: "RFS (no bonus)"}[m])
         d_min, d_max, d_act, d_tol = ((10.0e-3, 10.2e-3, 10.15e-3, 0.2e-3) if feature == HOLE
                                       else (9.90e-3, 10.0e-3, 9.92e-3, 0.1e-3))
         size_min = _len_input(f"{feature.capitalize()} minimum size", d_min, f"ts_g_smin_{feature}", system)
@@ -805,21 +847,54 @@ def _render_gdt(system) -> None:
         c1.metric("Bonus tolerance", units.fmt(g.bonus, "length", system, 4))
         c2.metric("Allowed zone Ø", units.fmt(g.zone_dia, "length", system, 4))
         c3.metric("Measured position Ø", units.fmt(g.measured_dia, "length", system, 4))
-        c4.metric("Virtual condition", units.fmt(g.virtual_condition, "length", system, 4))
-        if modifier == MMC and g.passed and not g.passed_rfs:
-            st.info(f"Without the MMC bonus this part would fail the stated Ø{_L(pos_tol, system):.4f} {u}: the bonus "
+        c4.metric("Virtual condition", units.fmt(g.virtual_condition, "length", system, 4),
+                  help="Boundary of the size plus the position tolerance, at MMC (RFS: shown at MMC) or at LMC.")
+        if modifier in (MMC, LMC) and g.passed and not g.passed_rfs:
+            st.info(f"Without the {modifier} bonus this part would fail the stated Ø{_L(pos_tol, system):.4f} {u}: the bonus "
                     "tolerance is what makes it acceptable.")
         st.plotly_chart(zone_figure(g, pos_tol, dx, dy, system), width="stretch")
         st.plotly_chart(bonus_figure(g, feature, size_min, size_max, actual, pos_tol, system), width="stretch")
         with st.expander("Method and limits"):
             st.markdown(
                 "- Hole: MMC is the smallest size, bonus = actual − minimum. Pin: MMC is the largest size, bonus = maximum − "
-                "actual. Allowed zone Ø = stated tolerance + bonus. Virtual condition = MMC − tolerance (hole) or "
-                "MMC + tolerance (pin).\n"
+                "actual. At LMC the bonus runs the other way (hole: maximum − actual; pin: actual − minimum). Allowed zone Ø = "
+                "stated tolerance + bonus. Virtual condition = MMC − tolerance (hole) or MMC + tolerance (pin); at LMC it is "
+                "LMC + tolerance (hole) or LMC − tolerance (pin).\n"
                 "- Measured position Ø = 2 × distance of the actual axis from true position; pass if it is ≤ the allowed zone "
                 "and the actual size is within its limits.\n"
                 "- Single feature of size, one position zone. Not modelled: datum reference frames and datum shift, "
-                "composite or projected tolerance zones, orientation and form, LMC.")
+                "composite or projected tolerance zones, orientation and form.")
+    _render_fastener(system)
+
+
+def _render_fastener(system) -> None:
+    u = units.label("length", system)
+    st.divider()
+    st.subheader("Fastener formula: position tolerance from hole and fastener sizes")
+    st.caption("Illustrative example values (an M8 screw in a close-fit clearance hole), not from a real project. "
+               "Learning tool based on ASME Y14.5 concepts, not a certified interpretation of the standard.")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        kind = st.radio("Fastener type", [FLOATING, FIXED], horizontal=True, key="ts_f_kind",
+                        format_func=lambda k: "Floating (clearance holes in all parts)" if k == FLOATING
+                        else "Fixed (fixed in one part)")
+    with c2:
+        hole = _len_input("Hole size at MMC (smallest hole, H)", 8.40e-3, "ts_f_hole", system)
+    with c3:
+        fast = _len_input("Fastener size at MMC (largest fastener, F)", 8.00e-3, "ts_f_fast", system)
+    f = fastener_position_tolerance(hole, fast, kind)
+    m1, m2 = st.columns(2)
+    m1.metric("Clearance H − F", units.fmt(f.clearance, "length", system, 4))
+    m2.metric("Position tolerance Ø per part (T)", units.fmt(f.tol_per_part, "length", system, 4),
+              help=f"Used here: {'T = H − F' if kind == FLOATING else 'T = (H − F) / 2'}. "
+                   "Floating: T = H − F. Fixed: T = (H − F) / 2.")
+    if f.tol_per_part == 0:
+        st.warning("Hole and fastener are the same size at MMC: there is no clearance, so the formula gives a zero tolerance.")
+    else:
+        st.caption(f"With both parts' holes at MMC and their axes at the limit of Ø{_L(f.tol_per_part, system):.4f} {u}, "
+                   "the fastener at MMC just fits with no clearance left. Both parts are assumed to get the same T. For a fixed "
+                   "fastener the formula assumes its perpendicularity is controlled (for example by a projected tolerance zone), "
+                   "which is not modelled here.")
 
 
 def render() -> None:
