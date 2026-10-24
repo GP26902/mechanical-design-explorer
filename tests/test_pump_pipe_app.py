@@ -1,4 +1,5 @@
 from pathlib import Path
+import pytest
 
 from streamlit.testing.v1 import AppTest
 
@@ -109,3 +110,48 @@ def test_fitted_from_points_mode_loads_shows_the_fit_and_works_in_us_units():
     assert not at.exception and any("Fitted pump curve" in i.value for i in at.info)
     at.number_input(key="pp_qd_US").set_value(1500.0).run()                                  # design flow beyond zero-head flow
     assert not at.exception and any("beyond the flow where the fitted head reaches zero" in e.value for e in at.error)
+
+
+def _q(at):
+    return float(at.metric[0].value.split()[0])
+
+
+def test_custom_roughness_and_k_inputs_change_the_flow():
+    at = _run()
+    q0 = _q(at)
+    at.selectbox(key="pp_material").set_value("Custom roughness").run()
+    assert not at.exception and _q(at) == pytest.approx(q0, rel=1e-3)                  # default 0.045 mm = commercial steel
+    at.number_input(key="pp_eps_SI").set_value(0.5).run()
+    assert not at.exception and _q(at) < q0
+    at.number_input(key="pp_eps_SI").set_value(6.0).run()                              # 6 mm in a 100 mm pipe: above the 0.05 limit
+    assert any("roughness" in e.value for e in at.error)
+    at = _run()
+    at.selectbox(key="pp_valve").set_value("Custom K").run()
+    at.number_input(key="pp_kvalve").set_value(30.0).run()
+    assert not at.exception and _q(at) < q0
+
+
+def test_tank_pressure_and_altitude_inputs():
+    at = _run()
+    q0 = _q(at)
+    at.number_input(key="pp_pd_SI").set_value(100.0).run()                             # 100 kPa on the discharge tank
+    assert not at.exception and _q(at) < q0
+    at = _run()
+    at.number_input(key="pp_ps_SI").set_value(-200.0).run()                            # below a perfect vacuum
+    assert any("vacuum" in e.value for e in at.error)
+    at = _run()
+    at.number_input(key="pp_elev_SI").set_value(3000.0).run()
+    assert not at.exception and any("Atmospheric pressure at the site: 70" in c.value for c in at.caption)
+
+
+def test_custom_fluid_disables_temperature_and_flags_bad_values():
+    at = _run()
+    assert not at.slider(key="pp_temp").disabled
+    at.radio(key="pp_fluid").set_value("Custom fluid").run()
+    assert not at.exception and at.slider(key="pp_temp").disabled
+    assert any("ignored for a custom fluid" in c.value for c in at.caption)
+    assert any("custom fluid (density" in c.value for c in at.caption)
+    at.number_input(key="pp_rho_SI").set_value(0.0).run()
+    assert not at.exception and any("Density" in e.value for e in at.error)
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception

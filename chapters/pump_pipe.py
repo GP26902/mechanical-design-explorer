@@ -7,8 +7,9 @@ system head. Bottleneck = section with the largest pressure drop. Cavitation scr
 available with NPSH required. Energy: hydraulic power rho g Q H, an assumed efficiency curve through the best
 efficiency point, motor and drive efficiencies, and a throttle-valve vs variable-speed-drive comparison at a
 reduced target flow. One or two identical pumps in parallel or series (equivalent quadratic curve). The pump curve
-can come from a design point or from a least-squares fit of entered points. Water only. Pump data and loss
-coefficients are illustrative.
+can come from a design point or from a least-squares fit of entered points. Tank gauge pressures and site elevation
+(standard atmosphere) enter the static head and NPSH. Water, or a custom fluid (density, viscosity, vapour pressure).
+Pump data and loss coefficients are illustrative.
 """
 import sys
 from pathlib import Path
@@ -37,17 +38,19 @@ ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction w
 
 **Energy.** Hydraulic power is ρgQH. Pump efficiency follows an assumed curve (η = η_BEP (2x − x²), x = flow / best-efficiency flow, with the best-efficiency flow taken as the design flow) that keeps the same shape under the affinity laws. Shaft and electrical power follow from it and from the motor efficiency. A throttle-valve vs variable-speed-drive comparison at a lower flow shows the head the valve wastes and the power and yearly cost the drive saves.
 
+**Realism inputs.** Pipe roughness and the valve and fitting K can be entered directly. Tank gauge pressures add (p_discharge − p_suction)/ρg to the static head, and the site elevation lowers the atmospheric pressure (standard atmosphere), which lowers NPSH available. A custom fluid replaces water's density, viscosity and vapour pressure.
+
 **Pumps and pump data.** One or two identical pumps can run in parallel (same head, flows add) or in series (same flow, heads add); both reduce to an equivalent quadratic curve. The pump curve can also be fitted to entered points by regressing head on Q², which gives the shutoff head and the coefficient a directly; the fit residual is shown.
 
-**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against the closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout; the pump-curve fit against a hand regression and numpy; parallel and series curves and operating points against closed forms.
+**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against the closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout; the pump-curve fit against a hand regression and numpy; parallel and series curves and operating points against closed forms; the standard atmosphere and tank-pressure static head by hand; a custom fluid with water's own properties against the water result; density scaling of pressure drop and power.
 
-**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. The efficiency curve shape and the constant motor and drive efficiencies are assumptions, not manufacturer data. Pump pairs are identical, run at the same speed and are always both running; interaction between pumps and check-valve losses are ignored. Water hammer, two-phase flow and parallel branches are not modelled.
+**Limitations:** one series path, one pipe material. The pump curve is not corrected for fluid viscosity, so results for viscous liquids are indicative only; a custom fluid's properties do not change with temperature. Loss coefficients are rounded textbook values. The efficiency curve shape and the constant motor and drive efficiencies are assumptions, not manufacturer data. Pump pairs are identical, run at the same speed and are always both running; interaction between pumps and check-valve losses are ignored. Water hammer, two-phase flow and parallel branches are not modelled.
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Darcy-Weisbach pipe and fitting losses against a centrifugal pump curve: operating point, "
                "bottleneck section, NPSH cavitation check, pump power and energy cost with a throttle vs "
-               "variable-speed comparison, parallel or series pumps and a pump curve fitted from points "
-               "(system-curve analysis, not CFD).")
+               "variable-speed comparison, parallel or series pumps, a pump curve fitted from points, tank pressures, "
+               "altitude and custom fluids (system-curve analysis, not CFD).")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
@@ -56,6 +59,8 @@ G = 9.81                    # m/s^2
 P_ATM = 101_325.0           # Pa, sea level
 NPSH_MARGIN = 1.3           # NPSHa / NPSHr below this is flagged "marginal"
 RE_LAMINAR, RE_TURBULENT = 2300.0, 4000.0
+
+CUSTOM_ROUGH, CUSTOM_K = "Custom roughness", "Custom K"
 
 DEFAULT_POINTS_Q = (0.0, 0.010, 0.020, 0.030)       # m^3/s, illustrative pump points for the "fitted from points" mode
 DEFAULT_POINTS_H = (40.0, 37.6, 30.2, 17.4)         # m, scattered slightly around H = 40 - 25000 Q^2
@@ -107,7 +112,21 @@ def water(temp_c: float) -> Fluid:
                  float(np.exp(np.interp(t, _T, np.log(_PV)))))
 
 
+def custom_fluid(rho: float, mu: float, pv: float) -> Fluid:
+    """A user-defined liquid (kg/m^3, Pa.s, Pa absolute). Properties are fixed: no temperature dependence."""
+    require_in_range(_finite(rho, "Density"), "Density", 100.0, 3000.0)
+    require_in_range(_finite(mu, "Viscosity"), "Viscosity", 1e-5, 10.0)
+    require_in_range(_finite(pv, "Vapour pressure"), "Vapour pressure", 0.0, 5e6)
+    return Fluid(float("nan"), float(rho), float(mu), float(pv))
+
+
 # ---- hydraulics ------------------------------------------------------------------------------
+def atm_pressure(elevation_m: float) -> float:
+    """Standard atmosphere: P = 101325 (1 - 2.25577e-5 h)^5.25588 Pa, h = site elevation in m."""
+    h = require_in_range(_finite(elevation_m, "Site elevation"), "Site elevation", -500.0, 6000.0)
+    return P_ATM * (1.0 - 2.25577e-5 * h) ** 5.25588
+
+
 def velocity(Q: float, D: float) -> float:
     return Q / (math.pi * D**2 / 4)
 
@@ -143,9 +162,10 @@ def minor_head(K: float, V: float) -> float:
     return K * V**2 / (2 * G)
 
 
-def npsha(p_atm: float, pv: float, rho: float, z_suction: float, h_loss_suction: float) -> float:
-    """NPSH available (m) for a suction tank open to the atmosphere. z_suction > 0: liquid level above the pump."""
-    return (p_atm - pv) / (rho * G) + z_suction - h_loss_suction
+def npsha(p_surface: float, pv: float, rho: float, z_suction: float, h_loss_suction: float) -> float:
+    """NPSH available (m). p_surface: absolute pressure on the suction tank surface (atmospheric for an open tank).
+    z_suction > 0: liquid level above the pump."""
+    return (p_surface - pv) / (rho * G) + z_suction - h_loss_suction
 
 
 def cavitation_status(npsh_a: float, npsh_r: float, margin: float = NPSH_MARGIN) -> str:
@@ -169,6 +189,12 @@ class Layout:
     k_valve: float = 0.0
     n_fittings: int = 0
     k_fitting: float = 0.0
+    p_suction: float = 0.0      # gauge pressure on the suction tank surface, Pa (0 = open tank)
+    p_discharge: float = 0.0    # gauge pressure on the discharge tank surface, Pa
+    site_elevation: float = 0.0     # m above sea level (sets the atmospheric pressure)
+
+
+MAX_REL_ROUGHNESS = 0.05        # upper end of the Colebrook-White / Moody chart range
 
 
 def validate_layout(L: Layout) -> Layout:
@@ -184,6 +210,16 @@ def validate_layout(L: Layout) -> Layout:
         _count(v, name)
     require_non_negative(_finite(L.k_valve, "Valve loss coefficient"), "Valve loss coefficient")
     require_non_negative(_finite(L.k_fitting, "Fitting loss coefficient"), "Fitting loss coefficient")
+    for name, d in (("suction", L.d_suction), ("discharge", L.d_discharge)):
+        if L.roughness / d > MAX_REL_ROUGHNESS:
+            raise ValidationError(f"The pipe roughness is too large for the {name} pipe diameter: roughness/diameter = "
+                                  f"{L.roughness / d:.3f} is above {MAX_REL_ROUGHNESS:g}, the limit of the friction-factor "
+                                  "equation. Lower the roughness or use a larger pipe.")
+    p_atm = atm_pressure(L.site_elevation)
+    for p, name in ((L.p_suction, "Suction tank pressure"), (L.p_discharge, "Discharge tank pressure")):
+        if _finite(p, name) <= -p_atm:
+            raise ValidationError(f"{name} must be above a perfect vacuum: gauge pressure must be greater than "
+                                  f"{-p_atm / 1000:.1f} kPa at this elevation.")
     return L
 
 
@@ -371,12 +407,18 @@ def sections_at(Q: float, L: Layout, fl: Fluid) -> list:
     return s
 
 
-def static_head(L: Layout) -> float:
-    return L.z_discharge - L.z_suction
+def static_head(L: Layout, fl: Optional[Fluid] = None) -> float:
+    """Elevation difference plus the tank pressure difference as a head: (z_d - z_s) + (p_d - p_s) / (rho g)."""
+    dp = L.p_discharge - L.p_suction
+    if dp == 0:
+        return L.z_discharge - L.z_suction
+    if fl is None:
+        raise ValidationError("A fluid is needed to turn the tank pressure difference into a head.")
+    return L.z_discharge - L.z_suction + dp / (fl.rho * G)
 
 
 def system_head(Q: float, L: Layout, fl: Fluid) -> float:
-    return static_head(L) + sum(s.head_loss for s in sections_at(Q, L, fl))
+    return static_head(L, fl) + sum(s.head_loss for s in sections_at(Q, L, fl))
 
 
 def solve_operating_point(h_pump: Callable[[float], float], h_sys: Callable[[float], float],
@@ -423,22 +465,25 @@ class Result:
     profile: list
 
 
-def analyse(L: Layout, pump: PumpData, rpm: float, temp_c: float = 20.0, n_points: int = 121) -> Result:
+def analyse(L: Layout, pump: PumpData, rpm: float, temp_c: float = 20.0, n_points: int = 121,
+            fluid: Optional[Fluid] = None) -> Result:
+    """fluid: optional custom liquid (see custom_fluid); when given, temp_c is ignored."""
     validate_layout(L)
     validate_pump(pump)
     r = speed_ratio(pump, rpm)
-    fl = water(temp_c)
+    fl = water(temp_c) if fluid is None else fluid
+    p_surface = atm_pressure(L.site_elevation) + L.p_suction          # absolute pressure on the suction tank surface
     q_max = pump_q_max(pump, r)
     q = np.linspace(0.0, q_max, n_points)
     h_sys = np.array([system_head(x, L, fl) for x in q])
     h_pump = pump_head(pump, q, r)
     suction_loss = lambda x: sum(s.head_loss for s in sections_at(x, L, fl) if s.side == "suction")
-    npsha_c = np.array([npsha(P_ATM, fl.pv, fl.rho, L.z_suction, suction_loss(x)) for x in q])
+    npsha_c = np.array([npsha(p_surface, fl.pv, fl.rho, L.z_suction, suction_loss(x)) for x in q])
     npshr_c = pump_npshr(pump, q, r)
 
     q_op = solve_operating_point(lambda x: float(pump_head(pump, x, r)), lambda x: system_head(x, L, fl), q_max)
     if q_op is None:
-        return Result(fl, r, static_head(L), q, h_pump, h_sys, npsha_c, npshr_c, None, None, [], [], [], None,
+        return Result(fl, r, static_head(L, fl), q, h_pump, h_sys, npsha_c, npshr_c, None, None, [], [], [], None,
                       None, None, None, [], [])
     h_op = float(pump_head(pump, q_op, r))
     secs = sections_at(q_op, L, fl)
@@ -446,14 +491,14 @@ def analyse(L: Layout, pump: PumpData, rpm: float, temp_c: float = 20.0, n_point
     total = sum(dp)
     share = [d / total for d in dp] if total > 0 else [0.0] * len(dp)
     bottleneck = secs[int(np.argmax(dp))].name
-    na = npsha(P_ATM, fl.pv, fl.rho, L.z_suction, suction_loss(q_op))
+    na = npsha(p_surface, fl.pv, fl.rho, L.z_suction, suction_loss(q_op))
     nr = float(pump_npshr(pump, q_op, r))
     trans = [s.name for s in secs if s.Re is not None and RE_LAMINAR <= s.Re <= RE_TURBULENT]
 
     # energy profile along the path: tank -> suction sections -> pump -> discharge sections -> tank
     node = lambda label, head, v: ProfileNode(label, head, v, fl.rho * G * (head - v**2 / (2 * G)))
     v_s, v_d = velocity(q_op, L.d_suction), velocity(q_op, L.d_discharge)
-    head = L.z_suction
+    head = L.z_suction + L.p_suction / (fl.rho * G)        # total head at the suction tank surface
     prof = [node("Suction tank surface", head, 0.0)]
     for s in secs:
         if s.side == "suction":
@@ -466,7 +511,7 @@ def analyse(L: Layout, pump: PumpData, rpm: float, temp_c: float = 20.0, n_point
         if s.side == "discharge":
             head -= s.head_loss
             prof.append(node(s.name, head, 0.0 if s.name == "Discharge exit" else s.velocity))
-    return Result(fl, r, static_head(L), q, h_pump, h_sys, npsha_c, npshr_c, q_op, h_op, secs, dp, share,
+    return Result(fl, r, static_head(L, fl), q, h_pump, h_sys, npsha_c, npshr_c, q_op, h_op, secs, dp, share,
                   bottleneck, na, nr, cavitation_status(na, nr), trans, prof)
 
 
@@ -806,11 +851,13 @@ def _num(label, kind, default, key, system, step_si, fmt="%.2f"):
 def render() -> None:
     system = get_unit_system()
     st.caption("Illustrative example values, not from a real project. Pump data and loss coefficients are generic "
-               "textbook-style numbers. Water only. System-curve analysis, not CFD.")
+               "textbook-style numbers. Water or a custom fluid. System-curve analysis, not CFD.")
     left, right = st.columns([1, 2], gap="large")
     with left:
         st.subheader("System")
-        mat = st.selectbox("Pipe material (roughness)", list(ROUGHNESS), key="pp_material")
+        mat = st.selectbox("Pipe material (roughness)", list(ROUGHNESS) + [CUSTOM_ROUGH], key="pp_material")
+        if mat == CUSTOM_ROUGH:
+            eps = _num("Pipe roughness", "length", 0.045e-3, "pp_eps", system, 0.005e-3, "%.4f")
         d_s = _slider("Suction pipe diameter", "length", 0.040, 0.250, 0.125, "pp_ds", system)
         l_s = _slider("Suction pipe length", "length_long", 0.5, 20.0, 3.0, "pp_ls", system)
         z_s = _slider("Suction tank level above pump (− = lift)", "length_long", -6.0, 6.0, 1.0, "pp_zs", system)
@@ -819,14 +866,29 @@ def render() -> None:
         z_d = _slider("Discharge tank level above pump", "length_long", 0.0, 40.0, 12.0, "pp_zd", system)
         n_b = st.slider("90° bends on the discharge side", 0, 12, 4, key="pp_bends")
         vt, vn = st.columns([2, 1])
-        valve = vt.selectbox("Valve type", list(VALVE_K), key="pp_valve")
+        valve = vt.selectbox("Valve type", list(VALVE_K) + [CUSTOM_K], key="pp_valve")
         n_v = vn.slider("Valves", 0, 4, 1, key="pp_nvalve")
+        if valve == CUSTOM_K:
+            kv = st.number_input("Valve loss coefficient K", 0.0, 1000.0, 2.0, 0.1, key="pp_kvalve", format="%.2f")
         ft, fn = st.columns([2, 1])
-        fitting = ft.selectbox("Fitting type", list(FITTING_K), key="pp_fitting")
+        fitting = ft.selectbox("Fitting type", list(FITTING_K) + [CUSTOM_K], key="pp_fitting")
         n_f = fn.slider("Fittings", 0, 6, 1, key="pp_nfit")
+        if fitting == CUSTOM_K:
+            kf = st.number_input("Fitting loss coefficient K", 0.0, 1000.0, 1.0, 0.1, key="pp_kfit", format="%.2f")
+        with st.expander("Tanks and site (illustrative)"):
+            p_s = _num("Suction tank gauge pressure (0 = open tank)", "pressure", 0.0, "pp_ps", system, 10e3, "%.1f")
+            p_d = _num("Discharge tank gauge pressure (0 = open tank)", "pressure", 0.0, "pp_pd", system, 10e3, "%.1f")
+            elev = _num("Site elevation above sea level", "length_long", 0.0, "pp_elev", system, 100.0, "%.0f")
         st.subheader("Pump and fluid")
         pct = st.slider("Pump speed (% of rated speed)", 50, 120, 100, key="pp_speed")
-        temp = st.slider("Water temperature (°C)", 0, 100, 20, key="pp_temp")
+        fluid_mode = st.radio("Fluid", ["Water", "Custom fluid"], horizontal=True, key="pp_fluid")
+        temp = st.slider("Water temperature (°C)", 0, 100, 20, key="pp_temp", disabled=fluid_mode != "Water")
+        if fluid_mode != "Water":
+            st.caption("The water temperature is ignored for a custom fluid. Defaults are illustrative, roughly a "
+                       "30 % glycol-water mix at 20 °C; the properties stay fixed.")
+            rho_c = _num("Density", "density", 1040.0, "pp_rho", system, 10.0, "%.1f")
+            mu_c = st.number_input("Viscosity (mPa·s = cP)", 0.01, 10000.0, 3.0, 0.1, key="pp_mu", format="%.2f")
+            pv_c = _num("Vapour pressure (absolute)", "pressure", 2e3, "pp_pv", system, 500.0, "%.2f")
         pc1, pc2 = st.columns(2)
         n_p = pc1.selectbox("Identical pumps", [1, 2], key="pp_npumps")
         arr = pc2.selectbox("Connected in", list(ARRANGEMENTS), key="pp_arrangement", disabled=n_p == 1)
@@ -859,7 +921,10 @@ def render() -> None:
             eta_m = st.number_input("Motor efficiency (%)", 1.0, 100.0, 92.0, 1.0, key="pp_eta_motor", format="%.0f")
             eta_v = st.number_input("Drive (VFD) efficiency (%)", 1.0, 100.0, 97.0, 1.0, key="pp_eta_vfd", format="%.0f")
 
-    lay = Layout(d_s, l_s, d_d, l_d, ROUGHNESS[mat], z_s, z_d, n_b, n_v, VALVE_K[valve], n_f, FITTING_K[fitting])
+    lay = Layout(d_s, l_s, d_d, l_d, eps if mat == CUSTOM_ROUGH else ROUGHNESS[mat], z_s, z_d, n_b, n_v,
+                 kv if valve == CUSTOM_K else VALVE_K[valve], n_f, kf if fitting == CUSTOM_K else FITTING_K[fitting],
+                 p_s, p_d, elev)
+    fluid = custom_fluid(rho_c, mu_c * 1e-3, pv_c) if fluid_mode != "Water" else None
     fit, pts_si = None, None
     if curve_mode == "Design point":
         pump = PumpData(h0, qd, hd, nr, rpm_rated, eta_bep / 100, n_p, arr)
@@ -871,9 +936,13 @@ def render() -> None:
                   units.to_si(pts.iloc[:, 1].to_numpy(dtype=float), "length_long", system))
         fit = fit_pump_points(*pts_si)
         pump = pump_from_fit(fit, qd, nr, rpm_rated, eta_bep / 100, n_p, arr)
-    r = analyse(lay, pump, pct / 100 * rpm_rated, float(temp))
+    r = analyse(lay, pump, pct / 100 * rpm_rated, float(temp), fluid=fluid)
 
     with right:
+        fl_text = (f"water at {r.fluid.temp_c:.0f} °C" if fluid is None else
+                   f"custom fluid (density {units.fmt(r.fluid.rho, 'density', system, 4)}, viscosity {r.fluid.mu * 1e3:.2f} mPa·s, "
+                   f"vapour pressure {units.fmt(r.fluid.pv, 'pressure', system, 3)} abs)")
+        st.caption(f"Fluid: {fl_text}. Atmospheric pressure at the site: {units.fmt(atm_pressure(lay.site_elevation), 'pressure', system, 4)}.")
         if fit is not None:
             hu = units.label("length_long", system)
             st.info(f"Fitted pump curve (per pump, rated speed): shutoff head {units.fmt(fit.h_shutoff, 'length_long', system, 3)}, "
@@ -952,10 +1021,14 @@ def render() -> None:
                 "- Two identical pumps: parallel gives H = H₀ − a(Q/2)² (flows add at equal head), series gives H = 2(H₀ − aQ²) "
                 "(heads add at equal flow). NPSH required and efficiency use the flow through each pump. Both pumps run at the same "
                 "speed and are always both running; interaction between them and check-valve losses are ignored.\n"
+                "- Static head = (z_discharge − z_suction) + (p_discharge − p_suction)/ρg with tank gauge pressures; atmospheric pressure "
+                "at the site elevation comes from the standard atmosphere, 101325 (1 − 2.25577×10⁻⁵ h)^5.25588 Pa. Roughness divided by "
+                "diameter must stay at or below 0.05 (the friction-factor equation's range). A custom fluid has fixed properties and "
+                "the pump curve is not corrected for its viscosity.\n"
                 "- Operating point: pump head = system head (static head + losses at that flow), found by bisection.\n"
                 "- Bottleneck: the section with the largest pressure drop at the operating point.\n"
-                "- Cavitation screening: NPSH available = (P_atm − P_vapour)/ρg + suction level − suction losses, at sea-level "
-                "pressure. Flagged \"marginal\" below 1.3 × NPSH required.\n"
+                "- Cavitation screening: NPSH available = (P_surface − P_vapour)/ρg + suction level − suction losses, with P_surface the absolute "
+                "pressure on the suction tank (site atmosphere plus tank gauge pressure). Flagged \"marginal\" below 1.3 × NPSH required.\n"
                 "- Power: hydraulic ρgQH; shaft = hydraulic / η; electrical = shaft / (motor × drive efficiency). Pump efficiency "
                 "η = η_BEP (2x − x²), x = Q / (speed ratio × design flow), is an assumed shape (floored at 5 %), not manufacturer data. "
                 "Motor and drive efficiencies are held constant. Yearly cost = kWh × price at constant running conditions.\n"
