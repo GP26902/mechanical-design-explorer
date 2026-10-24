@@ -1,7 +1,8 @@
 """Chapter auto-discovery. Pure module (no Streamlit) so it can be unit tested.
 
 A chapter is any chapters/<name>.py (not starting with '_') that defines TITLE, DESCRIPTION
-and a callable render(). It may also define KEY_PREFIX and ABOUT (both optional). Broken chapters are reported, never fatal.
+and a callable render(). It may also define KEY_PREFIX, ABOUT and ORDER (all optional). Chapters are listed by ORDER (default 50), then by
+filename, so a chapter can be placed after the others by giving it a larger number. Broken chapters are reported, never fatal.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 REQUIRED = ("TITLE", "DESCRIPTION", "render")
+DEFAULT_ORDER = 50.0
 
 
 @dataclass
@@ -24,6 +26,7 @@ class Chapter:
     error: Optional[str] = None            # set when the chapter could not be loaded
     key_prefix: str = ""                   # optional KEY_PREFIX: session keys the Reset button clears
     about: str = ""                        # optional ABOUT: markdown shown in the sidebar expander
+    order: float = 50.0                    # optional ORDER: lower numbers are listed first (ties: filename)
 
     @property
     def ok(self) -> bool:
@@ -31,7 +34,7 @@ class Chapter:
 
 
 def discover_chapters(chapters_dir: Path) -> list[Chapter]:
-    """Import every chapter file in chapters_dir, sorted by filename."""
+    """Import every chapter file in chapters_dir, sorted by ORDER (default 50) and then by filename."""
     chapters_dir = Path(chapters_dir)
     root = str(chapters_dir.resolve().parent)
     if root not in sys.path:               # chapters import from common/
@@ -42,6 +45,7 @@ def discover_chapters(chapters_dir: Path) -> list[Chapter]:
         if path.name.startswith("_"):
             continue
         found.append(_load(path))
+    found.sort(key=lambda c: (c.order, c.name))
     return found
 
 
@@ -60,5 +64,11 @@ def _load(path: Path) -> Chapter:
         problem = ", ".join(missing) if missing else "render (not callable)"
         return Chapter(name, name, "", None, error=f"{path.name} is missing: {problem}")
 
+    try:
+        order = float(getattr(module, "ORDER", DEFAULT_ORDER))
+        if order != order:                 # NaN
+            order = DEFAULT_ORDER
+    except (TypeError, ValueError):        # an unusable ORDER never breaks a chapter
+        order = DEFAULT_ORDER
     return Chapter(name, str(module.TITLE), str(module.DESCRIPTION), module.render, None,
-                   str(getattr(module, "KEY_PREFIX", "")), str(getattr(module, "ABOUT", "")))
+                   str(getattr(module, "KEY_PREFIX", "")), str(getattr(module, "ABOUT", "")), order)

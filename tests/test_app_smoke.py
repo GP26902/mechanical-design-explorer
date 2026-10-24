@@ -19,11 +19,11 @@ def test_invalid_input_shows_message_not_crash():
     assert any("greater than zero" in e.value for e in at.error)
 
 
-def test_example_runs_standalone_with_disclaimer():
-    at = AppTest.from_file(str(ROOT / "chapters" / "example_hello.py"), default_timeout=30).run()
+def test_basic_tools_runs_standalone_with_disclaimer():
+    at = AppTest.from_file(str(ROOT / "chapters" / "basic_tools.py"), default_timeout=30).run()
     assert not at.exception
     assert any("not certified design" in w.value for w in at.warning)
-    assert len(at.metric) == 1
+    assert len(at.tabs) == 2 and len(at.metric) >= 1
 
 
 def test_template_runs_standalone():

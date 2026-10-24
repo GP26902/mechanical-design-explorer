@@ -12,11 +12,22 @@ def _write(dirpath, name, body):
 GOOD = 'TITLE="T"\nDESCRIPTION="D"\ndef render():\n    pass\n'
 
 
-def test_real_chapters_dir_finds_example_and_skips_template():
-    names = [c.name for c in discover_chapters(REPO_CHAPTERS)]
-    assert "example_hello" in names
-    assert "_template" not in names
-    assert all(c.ok for c in discover_chapters(REPO_CHAPTERS))
+def test_real_chapters_dir_lists_chapters_in_order_and_skips_template():
+    found = discover_chapters(REPO_CHAPTERS)
+    assert [c.name for c in found] == ["beam_shaft", "pump_pipe", "tolerance_stack", "basic_tools"]
+    assert [c.title[0] for c in found] == ["1", "2", "3", "4"]                      # the basic tools chapter comes after chapter 3
+    assert "_template" not in [c.name for c in found] and all(c.ok for c in found)
+
+
+def test_order_attribute_places_a_chapter_last_and_bad_values_are_ignored(tmp_path):
+    ch = tmp_path / "chapters"; ch.mkdir()
+    _write(ch, "a_late.py", GOOD + "ORDER = 90\n")
+    _write(ch, "b_default.py", GOOD)
+    _write(ch, "c_early.py", GOOD + "ORDER = 10\n")
+    _write(ch, "d_bad.py", GOOD + "ORDER = 'last please'\n")
+    found = discover_chapters(ch)
+    assert [c.name for c in found] == ["c_early", "b_default", "d_bad", "a_late"]         # bad value falls back to 50; ties by filename
+    assert [c.order for c in found] == [10.0, 50.0, 50.0, 90.0]
 
 
 def test_dropping_in_a_file_adds_a_chapter(tmp_path):

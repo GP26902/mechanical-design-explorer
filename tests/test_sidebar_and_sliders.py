@@ -15,7 +15,7 @@ def test_chapters_declare_optional_prefix_and_about():
     chapters = {c.name: c for c in discover_chapters(ROOT / "chapters")}
     for name, prefix in [("beam_shaft", "bs_"), ("tolerance_stack", "ts_"), ("pump_pipe", "pp_")]:
         assert chapters[name].key_prefix == prefix and "Limitations" in chapters[name].about
-    assert chapters["example_hello"].key_prefix == "" and chapters["example_hello"].about == ""
+    assert chapters["basic_tools"].key_prefix == "bt_" and "Limitations" in chapters["basic_tools"].about
 
 
 def test_typing_exact_value_sets_slider_to_exact_value():
