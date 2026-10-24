@@ -86,3 +86,26 @@ def test_energy_section_in_us_units_and_hidden_without_operating_point():
     at.number_input(key="pp_h0_SI").set_value(31.0).run()
     at.slider(key="pp_zd_SI").set_value(40.0).run()
     assert not at.exception and "Pump efficiency" not in _labels(at)
+
+
+def test_two_pumps_raise_the_flow_and_label_the_arrangement():
+    at = _run()
+    q1 = float(at.metric[0].value.split()[0])
+    at.selectbox(key="pp_npumps").set_value(2).run()
+    assert not at.exception and float(at.metric[0].value.split()[0]) > q1                 # parallel by default
+    q_par = float(at.metric[0].value.split()[0])
+    at.selectbox(key="pp_arrangement").set_value("series").run()
+    assert not at.exception and float(at.metric[0].value.split()[0]) > q1 and not any("Input problem" in e.value for e in at.error)
+    assert q_par != float(at.metric[0].value.split()[0])
+
+
+def test_fitted_from_points_mode_loads_shows_the_fit_and_works_in_us_units():
+    at = _run()
+    at.radio(key="pp_curve_mode").set_value("Fitted from points").run()
+    assert not at.exception and not any("Input problem" in e.value for e in at.error)
+    assert any("Fitted pump curve" in i.value and "Residual" in i.value for i in at.info)
+    assert _labels(at)[:4] == ["Operating flow", "Pump head", "Largest pressure drop", "NPSH margin"]
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception and any("Fitted pump curve" in i.value for i in at.info)
+    at.number_input(key="pp_qd_US").set_value(1500.0).run()                                  # design flow beyond zero-head flow
+    assert not at.exception and any("beyond the flow where the fitted head reaches zero" in e.value for e in at.error)

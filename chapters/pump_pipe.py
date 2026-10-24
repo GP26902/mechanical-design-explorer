@@ -6,7 +6,9 @@ centrifugal pump curve scaled with the affinity laws, and the operating point wh
 system head. Bottleneck = section with the largest pressure drop. Cavitation screening compares NPSH
 available with NPSH required. Energy: hydraulic power rho g Q H, an assumed efficiency curve through the best
 efficiency point, motor and drive efficiencies, and a throttle-valve vs variable-speed-drive comparison at a
-reduced target flow. Water only. Pump data and loss coefficients are illustrative.
+reduced target flow. One or two identical pumps in parallel or series (equivalent quadratic curve). The pump curve
+can come from a design point or from a least-squares fit of entered points. Water only. Pump data and loss
+coefficients are illustrative.
 """
 import sys
 from pathlib import Path
@@ -14,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # lets `streamlit run chapters/x.py` find common/
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Optional
 
 import numpy as np
@@ -35,14 +37,17 @@ ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction w
 
 **Energy.** Hydraulic power is ρgQH. Pump efficiency follows an assumed curve (η = η_BEP (2x − x²), x = flow / best-efficiency flow, with the best-efficiency flow taken as the design flow) that keeps the same shape under the affinity laws. Shaft and electrical power follow from it and from the motor efficiency. A throttle-valve vs variable-speed-drive comparison at a lower flow shows the head the valve wastes and the power and yearly cost the drive saves.
 
-**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against the closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout.
+**Pumps and pump data.** One or two identical pumps can run in parallel (same head, flows add) or in series (same flow, heads add); both reduce to an equivalent quadratic curve. The pump curve can also be fitted to entered points by regressing head on Q², which gives the shutoff head and the coefficient a directly; the fit residual is shown.
 
-**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. The efficiency curve shape and the constant motor and drive efficiencies are assumptions, not manufacturer data. Water hammer, two-phase flow and parallel branches are not modelled.
+**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against the closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout; the pump-curve fit against a hand regression and numpy; parallel and series curves and operating points against closed forms.
+
+**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. The efficiency curve shape and the constant motor and drive efficiencies are assumptions, not manufacturer data. Pump pairs are identical, run at the same speed and are always both running; interaction between pumps and check-valve losses are ignored. Water hammer, two-phase flow and parallel branches are not modelled.
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Darcy-Weisbach pipe and fitting losses against a centrifugal pump curve: operating point, "
-               "bottleneck section, NPSH cavitation check, and pump power and energy cost with a throttle vs "
-               "variable-speed comparison (system-curve analysis, not CFD).")
+               "bottleneck section, NPSH cavitation check, pump power and energy cost with a throttle vs "
+               "variable-speed comparison, parallel or series pumps and a pump curve fitted from points "
+               "(system-curve analysis, not CFD).")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
@@ -51,6 +56,9 @@ G = 9.81                    # m/s^2
 P_ATM = 101_325.0           # Pa, sea level
 NPSH_MARGIN = 1.3           # NPSHa / NPSHr below this is flagged "marginal"
 RE_LAMINAR, RE_TURBULENT = 2300.0, 4000.0
+
+DEFAULT_POINTS_Q = (0.0, 0.010, 0.020, 0.030)       # m^3/s, illustrative pump points for the "fitted from points" mode
+DEFAULT_POINTS_H = (40.0, 37.6, 30.2, 17.4)         # m, scattered slightly around H = 40 - 25000 Q^2
 
 # Typical textbook loss coefficients, rounded. Illustrative: real values depend on size, type and source.
 K_ENTRANCE, K_EXIT, K_ELBOW_90 = 0.5, 1.0, 0.9
@@ -188,9 +196,16 @@ class PumpData:
     npshr_design: float         # NPSH required at the design flow, m
     rpm_rated: float
     eta_bep: float = 0.75       # pump efficiency at the best-efficiency (= design) flow, assumed
+    n_pumps: int = 1            # identical pumps, all at the same speed
+    arrangement: str = "parallel"   # how n_pumps > 1 are connected: "parallel" or "series"
 
     def a(self) -> float:
+        """Coefficient of one pump: H = H0 - a Q^2."""
         return (self.h_shutoff - self.h_design) / self.q_design**2
+
+
+ARRANGEMENTS = ("parallel", "series")
+MAX_PUMPS = 4
 
 
 def validate_pump(p: PumpData) -> PumpData:
@@ -201,6 +216,11 @@ def validate_pump(p: PumpData) -> PumpData:
     require_positive(_finite(p.npshr_design, "NPSH required"), "NPSH required")
     require_positive(_finite(p.rpm_rated, "Rated speed"), "Rated speed")
     require_in_range(_finite(p.eta_bep, "Best pump efficiency"), "Best pump efficiency", 1e-6, 1.0)
+    n = _finite(p.n_pumps, "Number of pumps")
+    if n != int(n) or not 1 <= n <= MAX_PUMPS:
+        raise ValidationError(f"Number of pumps must be a whole number from 1 to {MAX_PUMPS}.")
+    if p.arrangement not in ARRANGEMENTS:
+        raise ValidationError("Pump arrangement must be 'parallel' or 'series'.")
     return p
 
 
@@ -208,20 +228,40 @@ def speed_ratio(p: PumpData, rpm: float) -> float:
     return require_in_range(_finite(rpm, "Pump speed"), "Pump speed", 0.2 * p.rpm_rated, 1.5 * p.rpm_rated) / p.rpm_rated
 
 
-def pump_head(p: PumpData, Q, r: float = 1.0):
-    """Head at speed ratio r. Affinity laws (Q ~ N, H ~ N^2) turn H0 - aQ^2 into r^2 H0 - aQ^2."""
+def curve_coeffs(p: PumpData) -> tuple:
+    """(H0, a) of the equivalent single quadratic curve H = H0 - a Q^2 in the total flow Q, at rated speed.
+    n identical pumps in parallel: each carries Q/n at the same head, so H = H0 - a (Q/n)^2 -> (H0, a/n^2).
+    In series: each carries Q and adds its head, so H = n (H0 - a Q^2) -> (n H0, n a)."""
+    n = p.n_pumps
+    if n == 1:
+        return p.h_shutoff, p.a()
+    if p.arrangement == "parallel":
+        return p.h_shutoff, p.a() / n**2
+    return n * p.h_shutoff, n * p.a()
+
+
+def flow_per_pump(p: PumpData, Q):
+    """Flow through each pump: Q / n in parallel, Q in series (and for one pump)."""
     Q = np.asarray(Q, dtype=float)
-    return r**2 * p.h_shutoff - p.a() * Q**2
+    return Q / p.n_pumps if p.arrangement == "parallel" else Q
+
+
+def pump_head(p: PumpData, Q, r: float = 1.0):
+    """Total head at speed ratio r. Affinity laws (Q ~ N, H ~ N^2) turn H0 - aQ^2 into r^2 H0 - aQ^2."""
+    Q = np.asarray(Q, dtype=float)
+    h0, a = curve_coeffs(p)
+    return r**2 * h0 - a * Q**2
 
 
 def pump_q_max(p: PumpData, r: float = 1.0) -> float:
-    """Flow at which the pump head falls to zero."""
-    return math.sqrt(r**2 * p.h_shutoff / p.a())
+    """Total flow at which the head falls to zero."""
+    h0, a = curve_coeffs(p)
+    return math.sqrt(r**2 * h0 / a)
 
 
 def pump_npshr(p: PumpData, Q, r: float = 1.0):
     """NPSH required: rated-speed curve r0 + (rd - r0)(Q/Qd)^2 with r0 = 0.5 rd (assumed), scaled by affinity (~N^2)."""
-    Q = np.asarray(Q, dtype=float)
+    Q = flow_per_pump(p, Q)                                  # each pump sees its own flow
     r0 = 0.5 * p.npshr_design
     return r**2 * r0 + (p.npshr_design - r0) * (Q / p.q_design) ** 2
 
@@ -233,8 +273,63 @@ BEP_LOW, BEP_HIGH = 0.7, 1.2    # usual preferred operating range, fraction of b
 def pump_efficiency(p: PumpData, Q, r: float = 1.0):
     """Assumed efficiency curve eta = eta_bep (2x - x^2), x = Q / (r Q_design). Peaks at eta_bep when x = 1 and, because
     x uses the speed-scaled flow, keeps its shape under the affinity laws. Floored at ETA_FLOOR."""
-    x = np.asarray(Q, dtype=float) / (r * p.q_design)
+    x = flow_per_pump(p, Q) / (r * p.q_design)             # per-pump flow, so a pair has the same eta curve per pump
     return np.maximum(p.eta_bep * (2.0 * x - x**2), ETA_FLOOR)
+
+
+# ---- pump curve fitted from entered points -----------------------------------------------------
+@dataclass(frozen=True)
+class PumpFit:
+    h_shutoff: float        # m, intercept
+    a: float                # m per (m^3/s)^2
+    rms: float              # m, root-mean-square residual
+    max_resid: float        # m, largest absolute residual
+    n_points: int
+
+    def q_zero_head(self) -> float:
+        return math.sqrt(self.h_shutoff / self.a)
+
+
+def fit_pump_points(flows, heads) -> PumpFit:
+    """Least-squares fit of H = H0 - a Q^2 to (flow, head) points at rated speed: ordinary linear regression of H on x = Q^2
+    (slope = -a, intercept = H0). Flows in m^3/s, heads in m."""
+    try:
+        q = np.asarray(flows, dtype=float)
+        h = np.asarray(heads, dtype=float)
+    except (TypeError, ValueError):
+        raise ValidationError("Pump points must be numbers.") from None
+    if q.ndim != 1 or q.shape != h.shape:
+        raise ValidationError("Each pump point needs one flow and one head.")
+    if len(q) < 3:
+        raise ValidationError("Enter at least 3 pump points to fit a curve.")
+    if not (np.all(np.isfinite(q)) and np.all(np.isfinite(h))):
+        raise ValidationError("Pump points must be finite numbers; every row needs both a flow and a head.")
+    if np.any(q < 0):
+        raise ValidationError("Pump point flows cannot be negative.")
+    if np.any(h <= 0):
+        raise ValidationError("Pump point heads must be greater than zero.")
+    if len(np.unique(q)) < 2:
+        raise ValidationError("Pump points need at least 2 different flows.")
+    x = q**2
+    sxx = float(np.sum((x - x.mean()) ** 2))
+    slope = float(np.sum((x - x.mean()) * (h - h.mean())) / sxx)
+    a, h0 = -slope, float(h.mean() - slope * x.mean())
+    if a <= 0:
+        raise ValidationError("The points do not show head falling with flow, so no pump curve can be fitted. "
+                              "Check the entered values.")
+    res = h - (h0 - a * x)
+    return PumpFit(h0, a, float(math.sqrt(np.mean(res**2))), float(np.max(np.abs(res))), len(q))
+
+
+def pump_from_fit(fit: PumpFit, q_design: float, npshr_design: float, rpm_rated: float, eta_bep: float = 0.75,
+                  n_pumps: int = 1, arrangement: str = "parallel") -> PumpData:
+    """PumpData whose curve is the fitted one; the head at the design flow comes from the fit."""
+    require_positive(_finite(q_design, "Pump design flow"), "Pump design flow")
+    if q_design >= fit.q_zero_head():
+        raise ValidationError(f"The design flow ({q_design * 1000:.1f} L/s) is beyond the flow where the fitted head reaches "
+                              f"zero ({fit.q_zero_head() * 1000:.1f} L/s). Lower the design flow.")
+    return PumpData(fit.h_shutoff, q_design, fit.h_shutoff - fit.a * q_design**2, npshr_design, rpm_rated, eta_bep,
+                    n_pumps, arrangement)
 
 
 # ---- sections, system curve, operating point -------------------------------------------------
@@ -442,7 +537,8 @@ def compare_control(r: Result, L: Layout, pump: PumpData, frac: float, energy: E
     q = frac * r.q_op
     h_sys = system_head(q, L, r.fluid)
     h_thr = float(pump_head(pump, q, r.ratio))
-    ratio_v = math.sqrt((h_sys + pump.a() * q**2) / pump.h_shutoff)
+    h0_eq, a_eq = curve_coeffs(pump)
+    ratio_v = math.sqrt((h_sys + a_eq * q**2) / h0_eq)
     thr = operating_power(pump, q, h_thr, r.ratio, r.fluid.rho, energy.eta_motor)
     vfd = operating_power(pump, q, h_sys, ratio_v, r.fluid.rho, energy.eta_motor, energy.eta_vfd)
     kt, ct = annual_energy(thr.electrical, energy.hours_per_year, energy.price_per_kwh)
@@ -480,7 +576,8 @@ def _colour(v, vmin, vmax):
     return sample_colorscale(STRESS_COLORSCALE, [t])[0]
 
 
-def layout_figure(r: Result, lay: Layout, color_by: str, system: str) -> go.Figure:
+def layout_figure(r: Result, lay: Layout, color_by: str, system: str, pump_label: str = "PUMP",
+                  pump_note: str = "") -> go.Figure:
     """Schematic (not to scale) coloured by gauge pressure at pump-centreline elevation, or by velocity."""
     prof = {n.label: n for n in r.profile}
     sec = {s.name: s for s in r.sections}
@@ -553,10 +650,12 @@ def layout_figure(r: Result, lay: Layout, color_by: str, system: str) -> go.Figu
     fig.add_shape(type="circle", x0=PUMP_C[0] - PUMP_R, x1=PUMP_C[0] + PUMP_R, y0=-PUMP_R, y1=PUMP_R,
                   fillcolor="white", line=dict(color=col, width=4))
     u_h = units.label("length_long", system)
-    fig.add_annotation(x=PUMP_C[0], y=0, text=f"<b>PUMP</b><br>{units.from_si(r.h_op, 'length_long', system):.1f} {u_h}",
+    fig.add_annotation(x=PUMP_C[0], y=0, text=f"<b>{pump_label}</b><br>{units.from_si(r.h_op, 'length_long', system):.1f} {u_h}",
                        showarrow=False, font=dict(size=11))
     fig.add_annotation(x=0.6, y=-1.3, text="Suction tank", showarrow=False, yshift=-12)
     fig.add_annotation(x=11.75, y=1.8, text="Discharge tank", showarrow=False, yshift=-12)
+    if pump_note:
+        fig.add_annotation(x=PUMP_C[0], y=PUMP_R, text=pump_note, showarrow=False, yshift=14, font=dict(size=12))
     fig.add_annotation(x=PUMP_C[0], y=-PUMP_R, text=STATUS_TEXT[r.status], showarrow=False, yshift=-14,
                        font=dict(color=col, size=12))
     share = r.share[int(np.argmax(r.dp))]
@@ -573,7 +672,7 @@ def layout_figure(r: Result, lay: Layout, color_by: str, system: str) -> go.Figu
     return fig
 
 
-def curves_figure(r: Result, pump: PumpData, system: str) -> go.Figure:
+def curves_figure(r: Result, pump: PumpData, system: str, points=None) -> go.Figure:
     qu, hu = units.label("flow", system), units.label("length_long", system)
     Lq, Lh = (lambda v: units.from_si(v, "flow", system)), (lambda v: units.from_si(v, "length_long", system))
     fig = go.Figure()
@@ -581,8 +680,16 @@ def curves_figure(r: Result, pump: PumpData, system: str) -> go.Figure:
         qr = np.linspace(0, pump_q_max(pump, 1.0), 100)
         fig.add_trace(go.Scatter(x=Lq(qr), y=Lh(pump_head(pump, qr, 1.0)), mode="lines", name="Pump at rated speed",
                                  line=dict(color=GREY, dash="dot", width=2)))
-    fig.add_trace(go.Scatter(x=Lq(r.q), y=Lh(r.h_pump), mode="lines", name="Pump curve (this speed)",
-                             line=dict(color=ACCENT, width=3)))
+    if pump.n_pumps > 1:
+        one = replace(pump, n_pumps=1)
+        q1 = np.linspace(0, pump_q_max(one, r.ratio), 100)
+        fig.add_trace(go.Scatter(x=Lq(q1), y=Lh(pump_head(one, q1, r.ratio)), mode="lines", name="One pump (this speed)",
+                                 line=dict(color=GREY, dash="dot", width=2)))
+    name = "Pump curve (this speed)" if pump.n_pumps == 1 else f"{pump.n_pumps} pumps in {pump.arrangement} (this speed)"
+    fig.add_trace(go.Scatter(x=Lq(r.q), y=Lh(r.h_pump), mode="lines", name=name, line=dict(color=ACCENT, width=3)))
+    if points is not None:
+        fig.add_trace(go.Scatter(x=Lq(points[0]), y=Lh(points[1]), mode="markers", name="Entered points (rated speed)",
+                                 marker=dict(size=10, color=AMBER, symbol="diamond", line=dict(width=1.5, color="#222"))))
     fig.add_trace(go.Scatter(x=Lq(r.q), y=Lh(r.h_sys), mode="lines", name="System curve",
                              line=dict(color="#d97706", width=3)))
     fig.add_hline(y=Lh(r.static_head), line=dict(color=GREY, dash="dash", width=1), annotation_text="static head",
@@ -626,7 +733,8 @@ def npsh_figure(r: Result, system: str) -> go.Figure:
 def efficiency_figure(r: Result, pump: PumpData, system: str) -> go.Figure:
     qu = units.label("flow", system)
     Lq = lambda v: units.from_si(v, "flow", system)
-    q_bep = r.ratio * pump.q_design
+    share = pump.n_pumps if pump.arrangement == "parallel" else 1     # total flow per unit of per-pump flow
+    q_bep = r.ratio * pump.q_design * share                        # best-efficiency flow, total
     x_op = r.q_op / q_bep
     inside = BEP_LOW <= x_op <= BEP_HIGH
     fig = go.Figure()
@@ -719,10 +827,22 @@ def render() -> None:
         st.subheader("Pump and fluid")
         pct = st.slider("Pump speed (% of rated speed)", 50, 120, 100, key="pp_speed")
         temp = st.slider("Water temperature (°C)", 0, 100, 20, key="pp_temp")
-        with st.expander("Pump data (illustrative)"):
-            h0 = _num("Shutoff head at rated speed", "length_long", 40.0, "pp_h0", system, 0.5, "%.1f")
+        pc1, pc2 = st.columns(2)
+        n_p = pc1.selectbox("Identical pumps", [1, 2], key="pp_npumps")
+        arr = pc2.selectbox("Connected in", list(ARRANGEMENTS), key="pp_arrangement", disabled=n_p == 1)
+        with st.expander("Pump data (illustrative, per pump)"):
+            curve_mode = st.radio("Pump curve from", ["Design point", "Fitted from points"], horizontal=True, key="pp_curve_mode")
+            if curve_mode == "Design point":
+                h0 = _num("Shutoff head at rated speed", "length_long", 40.0, "pp_h0", system, 0.5, "%.1f")
             qd = _num("Design flow", "flow", 0.020, "pp_qd", system, 0.001 if system == units.SI else 6.3e-5, "%.1f")
-            hd = _num("Head at design flow", "length_long", 30.0, "pp_hd", system, 0.5, "%.1f")
+            if curve_mode == "Design point":
+                hd = _num("Head at design flow", "length_long", 30.0, "pp_hd", system, 0.5, "%.1f")
+            else:
+                qu_, hu_ = units.label("flow", system), units.label("length_long", system)
+                default_pts = pd.DataFrame({f"Flow ({qu_})": [round(units.from_si(v, "flow", system), 1) for v in DEFAULT_POINTS_Q],
+                                            f"Head ({hu_})": [round(units.from_si(v, "length_long", system), 1) for v in DEFAULT_POINTS_H]})
+                st.caption("Pump points at rated speed (illustrative). Add or remove rows; at least 3.")
+                pts_df = st.data_editor(default_pts, num_rows="dynamic", hide_index=True, key=f"pp_pts_{system}", width="stretch")
             nr = _num("NPSH required at design flow", "length_long", 3.5, "pp_nr", system, 0.1, "%.1f")
             rpm_rated = st.number_input("Rated speed (rpm)", value=1750.0, step=50.0, key="pp_rpm_rated")
             eta_bep = st.number_input("Best efficiency, at design flow (%)", 1.0, 100.0, 75.0, 1.0, key="pp_eta_bep",
@@ -740,14 +860,30 @@ def render() -> None:
             eta_v = st.number_input("Drive (VFD) efficiency (%)", 1.0, 100.0, 97.0, 1.0, key="pp_eta_vfd", format="%.0f")
 
     lay = Layout(d_s, l_s, d_d, l_d, ROUGHNESS[mat], z_s, z_d, n_b, n_v, VALVE_K[valve], n_f, FITTING_K[fitting])
-    pump = PumpData(h0, qd, hd, nr, rpm_rated, eta_bep / 100)
+    fit, pts_si = None, None
+    if curve_mode == "Design point":
+        pump = PumpData(h0, qd, hd, nr, rpm_rated, eta_bep / 100, n_p, arr)
+    else:
+        pts = pts_df.dropna(how="all")
+        if pts.isna().any().any():
+            raise ValidationError("Every pump point needs both a flow and a head.")
+        pts_si = (units.to_si(pts.iloc[:, 0].to_numpy(dtype=float), "flow", system),
+                  units.to_si(pts.iloc[:, 1].to_numpy(dtype=float), "length_long", system))
+        fit = fit_pump_points(*pts_si)
+        pump = pump_from_fit(fit, qd, nr, rpm_rated, eta_bep / 100, n_p, arr)
     r = analyse(lay, pump, pct / 100 * rpm_rated, float(temp))
 
     with right:
+        if fit is not None:
+            hu = units.label("length_long", system)
+            st.info(f"Fitted pump curve (per pump, rated speed): shutoff head {units.fmt(fit.h_shutoff, 'length_long', system, 3)}, "
+                    f"head at the design flow {units.fmt(pump.h_design, 'length_long', system, 3)}, zero head at "
+                    f"{units.fmt(fit.q_zero_head(), 'flow', system, 3)}. Residual: RMS {units.from_si(fit.rms, 'length_long', system):.2f} {hu}, "
+                    f"largest {units.from_si(fit.max_resid, 'length_long', system):.2f} {hu} over {fit.n_points} points.")
         if r.q_op is None:
             st.error("No operating point: the pump cannot overcome the static head plus losses at this speed "
                      "(the curves do not cross). Raise the pump speed or shutoff head, or lower the static head.")
-            st.plotly_chart(curves_figure(r, pump, system), width="stretch")
+            st.plotly_chart(curves_figure(r, pump, system, pts_si), width="stretch")
         else:
             msg = f"{STATUS_TEXT[r.status]}: NPSH available {units.fmt(r.npsh_a, 'length_long', system)} vs required " \
                   f"{units.fmt(r.npsh_r, 'length_long', system)} at the operating flow."
@@ -761,8 +897,9 @@ def render() -> None:
             m2.metric("Pump head", units.fmt(r.h_op, "length_long", system, 3))
             m3.metric("Largest pressure drop", r.bottleneck, f"{units.fmt(r.dp[top], 'pressure', system, 3)}", delta_color="off")
             m4.metric("NPSH margin", f"{r.npsh_a / r.npsh_r:.1f} × required")
-            st.plotly_chart(layout_figure(r, lay, color_by, system), width="stretch")
-            st.plotly_chart(curves_figure(r, pump, system), width="stretch")
+            note = "" if pump.n_pumps == 1 else f"{pump.n_pumps} identical pumps in {pump.arrangement}"
+            st.plotly_chart(layout_figure(r, lay, color_by, system, "PUMP", note), width="stretch")
+            st.plotly_chart(curves_figure(r, pump, system, pts_si), width="stretch")
             st.plotly_chart(npsh_figure(r, system), width="stretch")
             pu, vu, hu = (units.label("pressure", system), units.label("velocity", system), units.label("length_long", system))
             st.dataframe(pd.DataFrame({
@@ -780,7 +917,7 @@ def render() -> None:
             en = validate_energy(EnergyInputs(hours, price, eta_m / 100, eta_v / 100))
             pw = operating_power(pump, r.q_op, r.h_op, r.ratio, r.fluid.rho, en.eta_motor)
             kwh, cost = annual_energy(pw.electrical, en.hours_per_year, en.price_per_kwh)
-            x_bep = r.q_op / (r.ratio * pump.q_design)
+            x_bep = float(flow_per_pump(pump, r.q_op)) / (r.ratio * pump.q_design)
             e1, e2, e3, e4 = st.columns(4)
             _metric(e1, "Pump efficiency", f"{pw.eta * 100:.0f} %", f"at {x_bep * 100:.0f} % of best-efficiency flow")
             _metric(e2, "Shaft power", units.fmt(pw.shaft, "power", system, 3))
@@ -810,7 +947,11 @@ def render() -> None:
                 "Re 2300–4000 is flagged as transitional. Fittings: h = K V²/2g with rounded, typical textbook K values "
                 "(real values depend on size, type and source).\n"
                 "- Pump: quadratic curve H = H₀ − aQ² through the shutoff and design points, scaled with the affinity laws "
-                "(Q ∝ N, H ∝ N²). The NPSH-required shape (half the design value at zero flow, rising with Q²) is an assumption.\n"
+                "(Q ∝ N, H ∝ N²), or fitted to entered points by regressing head on Q² (slope −a, intercept H₀; the residual is shown). "
+                "The NPSH-required shape (half the design value at zero flow, rising with Q²) is an assumption.\n"
+                "- Two identical pumps: parallel gives H = H₀ − a(Q/2)² (flows add at equal head), series gives H = 2(H₀ − aQ²) "
+                "(heads add at equal flow). NPSH required and efficiency use the flow through each pump. Both pumps run at the same "
+                "speed and are always both running; interaction between them and check-valve losses are ignored.\n"
                 "- Operating point: pump head = system head (static head + losses at that flow), found by bisection.\n"
                 "- Bottleneck: the section with the largest pressure drop at the operating point.\n"
                 "- Cavitation screening: NPSH available = (P_atm − P_vapour)/ρg + suction level − suction losses, at sea-level "
