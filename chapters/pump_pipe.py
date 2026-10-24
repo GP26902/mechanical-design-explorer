@@ -9,6 +9,7 @@ efficiency point, motor and drive efficiencies, and a throttle-valve vs variable
 reduced target flow. One or two identical pumps in parallel or series (equivalent quadratic curve). The pump curve
 can come from a design point or from a least-squares fit of entered points. Tank gauge pressures and site elevation
 (standard atmosphere) enter the static head and NPSH. Water, or a custom fluid (density, viscosity, vapour pressure).
+Example systems load illustrative inputs; the section table and the curves can be downloaded as CSV.
 Pump data and loss coefficients are illustrative.
 """
 import sys
@@ -38,6 +39,8 @@ ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction w
 
 **Energy.** Hydraulic power is ρgQH. Pump efficiency follows an assumed curve (η = η_BEP (2x − x²), x = flow / best-efficiency flow, with the best-efficiency flow taken as the design flow) that keeps the same shape under the affinity laws. Shaft and electrical power follow from it and from the motor efficiency. A throttle-valve vs variable-speed-drive comparison at a lower flow shows the head the valve wastes and the power and yearly cost the drive saves.
 
+**Examples and export.** The example dropdown loads a set of illustrative inputs (a baseline, an undersized pipe, a hot-water suction lift, two pumps in parallel, a pressurised glycol loop at altitude); edit any input afterwards. The section table and the curve data download as CSV, in the units you have chosen.
+
 **Realism inputs.** Pipe roughness and the valve and fitting K can be entered directly. Tank gauge pressures add (p_discharge − p_suction)/ρg to the static head, and the site elevation lowers the atmospheric pressure (standard atmosphere), which lowers NPSH available. A custom fluid replaces water's density, viscosity and vapour pressure.
 
 **Pumps and pump data.** One or two identical pumps can run in parallel (same head, flows add) or in series (same flow, heads add); both reduce to an equivalent quadratic curve. The pump curve can also be fitted to entered points by regressing head on Q², which gives the shutoff head and the coefficient a directly; the fit residual is shown.
@@ -48,7 +51,7 @@ ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction w
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Darcy-Weisbach pipe and fitting losses against a centrifugal pump curve: operating point, "
-               "bottleneck section, NPSH cavitation check, pump power and energy cost with a throttle vs "
+               "bottleneck section, NPSH cavitation check, example systems, CSV export, pump power and energy cost with a throttle vs "
                "variable-speed comparison, parallel or series pumps, a pump curve fitted from points, tank pressures, "
                "altitude and custom fluids (system-curve analysis, not CFD).")
 
@@ -61,6 +64,72 @@ NPSH_MARGIN = 1.3           # NPSHa / NPSHr below this is flagged "marginal"
 RE_LAMINAR, RE_TURBULENT = 2300.0, 4000.0
 
 CUSTOM_ROUGH, CUSTOM_K = "Custom roughness", "Custom K"
+
+# ---- example systems (illustrative, SI) --------------------------------------------------------------
+DEFAULT_EXAMPLE = "Cooling-water transfer (default)"
+BASE_VALUES = dict(material="Commercial steel", d_s=0.125, l_s=3.0, z_s=1.0, d_d=0.100, l_d=60.0, z_d=12.0, bends=4,
+                   valve="Gate valve (open)", n_valves=1, fitting="Tee, flow through run", n_fit=1, p_s=0.0, p_d=0.0,
+                   elev=0.0, speed=100, fluid="Water", temp=20, n_pumps=1, arrangement="parallel", h0=40.0, qd=0.020,
+                   hd=30.0, nr=3.5)
+EXAMPLES = {
+    DEFAULT_EXAMPLE: dict(note="Baseline transfer line. The pump runs well to the right of its best-efficiency flow, so look at "
+                               "the efficiency warning and the throttle vs variable-speed saving.", values={}),
+    "Undersized discharge pipe": dict(note="A 65 mm, 80 m discharge line with six bends: the discharge pipe takes most of the "
+                                           "pressure drop and the flow falls to about half of the baseline.",
+                                      values=dict(d_d=0.065, l_d=80.0, bends=6)),
+    "Hot water with a suction lift": dict(note="75 °C water and a pump 3 m above the tank: NPSH available falls below NPSH "
+                                               "required and the cavitation check turns red.",
+                                          values=dict(z_s=-3.0, temp=75)),
+    "Two pumps in parallel": dict(note="A larger, longer system. One pump runs at about 130 % of its best-efficiency flow; "
+                                       "two in parallel put each close to it. Switch the pump count to compare.",
+                                  values=dict(d_s=0.150, d_d=0.125, l_d=150.0, z_d=18.0, bends=6, n_pumps=2,
+                                              arrangement="parallel")),
+    "Pressurised glycol loop at altitude": dict(note="A 30 % glycol-water style custom fluid, 150 kPa on the discharge tank and "
+                                                     "a 1500 m site: higher static head, lower atmospheric NPSH. The pump "
+                                                     "curve is not corrected for viscosity.",
+                                                values=dict(z_d=5.0, l_d=80.0, p_d=150e3, elev=1500.0, fluid="Custom fluid")),
+}
+
+
+def build_example(name: str) -> tuple:
+    """(Layout, PumpData, water temperature C, custom Fluid or None) for an example system, at rated speed."""
+    V = {**BASE_VALUES, **EXAMPLES[name]["values"]}
+    lay = Layout(V["d_s"], V["l_s"], V["d_d"], V["l_d"], ROUGHNESS[V["material"]], V["z_s"], V["z_d"], V["bends"],
+                 V["n_valves"], VALVE_K[V["valve"]], V["n_fit"], FITTING_K[V["fitting"]], V["p_s"], V["p_d"], V["elev"])
+    pump = PumpData(V["h0"], V["qd"], V["hd"], V["nr"], 1750.0, 0.75, V["n_pumps"], V["arrangement"])
+    fluid = custom_fluid(1040.0, 3.0e-3, 2.0e3) if V["fluid"] == "Custom fluid" else None
+    return lay, pump, float(V["temp"]), fluid
+
+
+def sections_csv(r: "Result", system: str) -> bytes:
+    """The section table at the operating point, with units in the column names. Plain table, one row per section."""
+    if r.q_op is None:
+        raise ValidationError("There is no operating point, so there are no sections to export.")
+    fu = lambda v, kind, nd: round(float(units.from_si(v, kind, system)), nd)
+    df = pd.DataFrame({
+        "Section": [s.name for s in r.sections],
+        "Side": [s.side for s in r.sections],
+        f"Diameter ({units.label('length', system)})": [fu(s.diameter, "length", 4) for s in r.sections],
+        f"Velocity ({units.label('velocity', system)})": [fu(s.velocity, "velocity", 4) for s in r.sections],
+        "Reynolds number": pd.array([None if s.Re is None else round(s.Re) for s in r.sections], dtype="Int64"),   # whole numbers, blank for fittings
+        "Friction factor": [None if s.f is None else round(s.f, 5) for s in r.sections],
+        f"Head loss ({units.label('length_long', system)})": [fu(s.head_loss, "length_long", 4) for s in r.sections],
+        f"Pressure drop ({units.label('pressure', system)})": [fu(d, "pressure", 4) for d in r.dp],
+        "Share of drop (%)": [round(x * 100, 2) for x in r.share],
+        "Bottleneck": ["yes" if s.name == r.bottleneck else "" for s in r.sections]})
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def curves_csv(r: "Result", system: str) -> bytes:
+    """Pump, system and NPSH curves on the plotted flow grid (at the current pump speed), units in the column names."""
+    hu = units.label("length_long", system)
+    df = pd.DataFrame({
+        f"Flow ({units.label('flow', system)})": np.round(units.from_si(r.q, "flow", system), 5),
+        f"Pump head ({hu})": np.round(units.from_si(r.h_pump, "length_long", system), 4),
+        f"System head ({hu})": np.round(units.from_si(r.h_sys, "length_long", system), 4),
+        f"NPSH available ({hu})": np.round(units.from_si(r.npsha_curve, "length_long", system), 4),
+        f"NPSH required ({hu})": np.round(units.from_si(r.npshr_curve, "length_long", system), 4)})
+    return df.to_csv(index=False).encode("utf-8")
 
 DEFAULT_POINTS_Q = (0.0, 0.010, 0.020, 0.030)       # m^3/s, illustrative pump points for the "fitted from points" mode
 DEFAULT_POINTS_H = (40.0, 37.6, 30.2, 17.4)         # m, scattered slightly around H = 40 - 25000 Q^2
@@ -854,72 +923,81 @@ def render() -> None:
                "textbook-style numbers. Water or a custom fluid. System-curve analysis, not CFD.")
     left, right = st.columns([1, 2], gap="large")
     with left:
+        example = st.selectbox("Example system (loads the inputs below)", list(EXAMPLES), key="pp_example")
+        V = {**BASE_VALUES, **EXAMPLES[example]["values"]}
+        ek = (lambda base: base) if example == DEFAULT_EXAMPLE else (lambda base: f"{base}_e{list(EXAMPLES).index(example)}")
+        st.caption(f"Illustrative example, not from a real project. {EXAMPLES[example]['note']} Edit any input afterwards.")
         st.subheader("System")
-        mat = st.selectbox("Pipe material (roughness)", list(ROUGHNESS) + [CUSTOM_ROUGH], key="pp_material")
+        mats = list(ROUGHNESS) + [CUSTOM_ROUGH]
+        mat = st.selectbox("Pipe material (roughness)", mats, index=mats.index(V["material"]), key=ek("pp_material"))
         if mat == CUSTOM_ROUGH:
-            eps = _num("Pipe roughness", "length", 0.045e-3, "pp_eps", system, 0.005e-3, "%.4f")
-        d_s = _slider("Suction pipe diameter", "length", 0.040, 0.250, 0.125, "pp_ds", system)
-        l_s = _slider("Suction pipe length", "length_long", 0.5, 20.0, 3.0, "pp_ls", system)
-        z_s = _slider("Suction tank level above pump (− = lift)", "length_long", -6.0, 6.0, 1.0, "pp_zs", system)
-        d_d = _slider("Discharge pipe diameter", "length", 0.040, 0.250, 0.100, "pp_dd", system)
-        l_d = _slider("Discharge pipe length", "length_long", 5.0, 300.0, 60.0, "pp_ld", system)
-        z_d = _slider("Discharge tank level above pump", "length_long", 0.0, 40.0, 12.0, "pp_zd", system)
-        n_b = st.slider("90° bends on the discharge side", 0, 12, 4, key="pp_bends")
+            eps = _num("Pipe roughness", "length", 0.045e-3, ek("pp_eps"), system, 0.005e-3, "%.4f")
+        d_s = _slider("Suction pipe diameter", "length", 0.040, 0.250, V["d_s"], ek("pp_ds"), system)
+        l_s = _slider("Suction pipe length", "length_long", 0.5, 20.0, V["l_s"], ek("pp_ls"), system)
+        z_s = _slider("Suction tank level above pump (− = lift)", "length_long", -6.0, 6.0, V["z_s"], ek("pp_zs"), system)
+        d_d = _slider("Discharge pipe diameter", "length", 0.040, 0.250, V["d_d"], ek("pp_dd"), system)
+        l_d = _slider("Discharge pipe length", "length_long", 5.0, 300.0, V["l_d"], ek("pp_ld"), system)
+        z_d = _slider("Discharge tank level above pump", "length_long", 0.0, 40.0, V["z_d"], ek("pp_zd"), system)
+        n_b = st.slider("90° bends on the discharge side", 0, 12, V["bends"], key=ek("pp_bends"))
         vt, vn = st.columns([2, 1])
-        valve = vt.selectbox("Valve type", list(VALVE_K) + [CUSTOM_K], key="pp_valve")
-        n_v = vn.slider("Valves", 0, 4, 1, key="pp_nvalve")
+        valves = list(VALVE_K) + [CUSTOM_K]
+        valve = vt.selectbox("Valve type", valves, index=valves.index(V["valve"]), key=ek("pp_valve"))
+        n_v = vn.slider("Valves", 0, 4, V["n_valves"], key=ek("pp_nvalve"))
         if valve == CUSTOM_K:
-            kv = st.number_input("Valve loss coefficient K", 0.0, 1000.0, 2.0, 0.1, key="pp_kvalve", format="%.2f")
+            kv = st.number_input("Valve loss coefficient K", 0.0, 1000.0, 2.0, 0.1, key=ek("pp_kvalve"), format="%.2f")
         ft, fn = st.columns([2, 1])
-        fitting = ft.selectbox("Fitting type", list(FITTING_K) + [CUSTOM_K], key="pp_fitting")
-        n_f = fn.slider("Fittings", 0, 6, 1, key="pp_nfit")
+        fittings = list(FITTING_K) + [CUSTOM_K]
+        fitting = ft.selectbox("Fitting type", fittings, index=fittings.index(V["fitting"]), key=ek("pp_fitting"))
+        n_f = fn.slider("Fittings", 0, 6, V["n_fit"], key=ek("pp_nfit"))
         if fitting == CUSTOM_K:
-            kf = st.number_input("Fitting loss coefficient K", 0.0, 1000.0, 1.0, 0.1, key="pp_kfit", format="%.2f")
-        with st.expander("Tanks and site (illustrative)"):
-            p_s = _num("Suction tank gauge pressure (0 = open tank)", "pressure", 0.0, "pp_ps", system, 10e3, "%.1f")
-            p_d = _num("Discharge tank gauge pressure (0 = open tank)", "pressure", 0.0, "pp_pd", system, 10e3, "%.1f")
-            elev = _num("Site elevation above sea level", "length_long", 0.0, "pp_elev", system, 100.0, "%.0f")
+            kf = st.number_input("Fitting loss coefficient K", 0.0, 1000.0, 1.0, 0.1, key=ek("pp_kfit"), format="%.2f")
+        with st.expander("Tanks and site (illustrative)", expanded=example != DEFAULT_EXAMPLE and bool(V["p_d"] or V["p_s"] or V["elev"])):
+            p_s = _num("Suction tank gauge pressure (0 = open tank)", "pressure", V["p_s"], ek("pp_ps"), system, 10e3, "%.1f")
+            p_d = _num("Discharge tank gauge pressure (0 = open tank)", "pressure", V["p_d"], ek("pp_pd"), system, 10e3, "%.1f")
+            elev = _num("Site elevation above sea level", "length_long", V["elev"], ek("pp_elev"), system, 100.0, "%.0f")
         st.subheader("Pump and fluid")
-        pct = st.slider("Pump speed (% of rated speed)", 50, 120, 100, key="pp_speed")
-        fluid_mode = st.radio("Fluid", ["Water", "Custom fluid"], horizontal=True, key="pp_fluid")
-        temp = st.slider("Water temperature (°C)", 0, 100, 20, key="pp_temp", disabled=fluid_mode != "Water")
+        pct = st.slider("Pump speed (% of rated speed)", 50, 120, V["speed"], key=ek("pp_speed"))
+        fluid_mode = st.radio("Fluid", ["Water", "Custom fluid"], index=["Water", "Custom fluid"].index(V["fluid"]),
+                              horizontal=True, key=ek("pp_fluid"))
+        temp = st.slider("Water temperature (°C)", 0, 100, V["temp"], key=ek("pp_temp"), disabled=fluid_mode != "Water")
         if fluid_mode != "Water":
             st.caption("The water temperature is ignored for a custom fluid. Defaults are illustrative, roughly a "
                        "30 % glycol-water mix at 20 °C; the properties stay fixed.")
-            rho_c = _num("Density", "density", 1040.0, "pp_rho", system, 10.0, "%.1f")
-            mu_c = st.number_input("Viscosity (mPa·s = cP)", 0.01, 10000.0, 3.0, 0.1, key="pp_mu", format="%.2f")
-            pv_c = _num("Vapour pressure (absolute)", "pressure", 2e3, "pp_pv", system, 500.0, "%.2f")
+            rho_c = _num("Density", "density", 1040.0, ek("pp_rho"), system, 10.0, "%.1f")
+            mu_c = st.number_input("Viscosity (mPa·s = cP)", 0.01, 10000.0, 3.0, 0.1, key=ek("pp_mu"), format="%.2f")
+            pv_c = _num("Vapour pressure (absolute)", "pressure", 2e3, ek("pp_pv"), system, 500.0, "%.2f")
         pc1, pc2 = st.columns(2)
-        n_p = pc1.selectbox("Identical pumps", [1, 2], key="pp_npumps")
-        arr = pc2.selectbox("Connected in", list(ARRANGEMENTS), key="pp_arrangement", disabled=n_p == 1)
+        n_p = pc1.selectbox("Identical pumps", [1, 2], index=[1, 2].index(V["n_pumps"]), key=ek("pp_npumps"))
+        arr = pc2.selectbox("Connected in", list(ARRANGEMENTS), index=list(ARRANGEMENTS).index(V["arrangement"]),
+                            key=ek("pp_arrangement"), disabled=n_p == 1)
         with st.expander("Pump data (illustrative, per pump)"):
-            curve_mode = st.radio("Pump curve from", ["Design point", "Fitted from points"], horizontal=True, key="pp_curve_mode")
+            curve_mode = st.radio("Pump curve from", ["Design point", "Fitted from points"], horizontal=True, key=ek("pp_curve_mode"))
             if curve_mode == "Design point":
-                h0 = _num("Shutoff head at rated speed", "length_long", 40.0, "pp_h0", system, 0.5, "%.1f")
-            qd = _num("Design flow", "flow", 0.020, "pp_qd", system, 0.001 if system == units.SI else 6.3e-5, "%.1f")
+                h0 = _num("Shutoff head at rated speed", "length_long", V["h0"], ek("pp_h0"), system, 0.5, "%.1f")
+            qd = _num("Design flow", "flow", V["qd"], ek("pp_qd"), system, 0.001 if system == units.SI else 6.3e-5, "%.1f")
             if curve_mode == "Design point":
-                hd = _num("Head at design flow", "length_long", 30.0, "pp_hd", system, 0.5, "%.1f")
+                hd = _num("Head at design flow", "length_long", V["hd"], ek("pp_hd"), system, 0.5, "%.1f")
             else:
                 qu_, hu_ = units.label("flow", system), units.label("length_long", system)
                 default_pts = pd.DataFrame({f"Flow ({qu_})": [round(units.from_si(v, "flow", system), 1) for v in DEFAULT_POINTS_Q],
                                             f"Head ({hu_})": [round(units.from_si(v, "length_long", system), 1) for v in DEFAULT_POINTS_H]})
                 st.caption("Pump points at rated speed (illustrative). Add or remove rows; at least 3.")
-                pts_df = st.data_editor(default_pts, num_rows="dynamic", hide_index=True, key=f"pp_pts_{system}", width="stretch")
-            nr = _num("NPSH required at design flow", "length_long", 3.5, "pp_nr", system, 0.1, "%.1f")
-            rpm_rated = st.number_input("Rated speed (rpm)", value=1750.0, step=50.0, key="pp_rpm_rated")
-            eta_bep = st.number_input("Best efficiency, at design flow (%)", 1.0, 100.0, 75.0, 1.0, key="pp_eta_bep",
+                pts_df = st.data_editor(default_pts, num_rows="dynamic", hide_index=True, key=f"{ek('pp_pts')}_{system}", width="stretch")
+            nr = _num("NPSH required at design flow", "length_long", V["nr"], ek("pp_nr"), system, 0.1, "%.1f")
+            rpm_rated = st.number_input("Rated speed (rpm)", value=1750.0, step=50.0, key=ek("pp_rpm_rated"))
+            eta_bep = st.number_input("Best efficiency, at design flow (%)", 1.0, 100.0, 75.0, 1.0, key=ek("pp_eta_bep"),
                                       format="%.0f", help="Assumed efficiency curve peaks here; not manufacturer data.")
         color_by = st.radio("Colour the layout by", ["pressure", "velocity"], format_func=str.capitalize,
-                            horizontal=True, key="pp_color")
+                            horizontal=True, key=ek("pp_color"))
         st.caption(f"Pump speed: {pct / 100 * rpm_rated:,.0f} rpm")
         st.subheader("Energy and control")
-        target = st.slider("Flow actually needed (% of the operating flow)", 30, 100, 70, key="pp_target",
+        target = st.slider("Flow actually needed (% of the operating flow)", 30, 100, 70, key=ek("pp_target"),
                            help="Compares a throttle valve with a variable-speed drive at this lower flow.")
         with st.expander("Energy cost inputs (illustrative)"):
-            hours = st.number_input("Running hours per year", 1.0, 8760.0, 4000.0, 100.0, key="pp_hours", format="%.0f")
-            price = st.number_input("Electricity price ($/kWh)", 0.0, 5.0, 0.10, 0.01, key="pp_price", format="%.3f")
-            eta_m = st.number_input("Motor efficiency (%)", 1.0, 100.0, 92.0, 1.0, key="pp_eta_motor", format="%.0f")
-            eta_v = st.number_input("Drive (VFD) efficiency (%)", 1.0, 100.0, 97.0, 1.0, key="pp_eta_vfd", format="%.0f")
+            hours = st.number_input("Running hours per year", 1.0, 8760.0, 4000.0, 100.0, key=ek("pp_hours"), format="%.0f")
+            price = st.number_input("Electricity price ($/kWh)", 0.0, 5.0, 0.10, 0.01, key=ek("pp_price"), format="%.3f")
+            eta_m = st.number_input("Motor efficiency (%)", 1.0, 100.0, 92.0, 1.0, key=ek("pp_eta_motor"), format="%.0f")
+            eta_v = st.number_input("Drive (VFD) efficiency (%)", 1.0, 100.0, 97.0, 1.0, key=ek("pp_eta_vfd"), format="%.0f")
 
     lay = Layout(d_s, l_s, d_d, l_d, eps if mat == CUSTOM_ROUGH else ROUGHNESS[mat], z_s, z_d, n_b, n_v,
                  kv if valve == CUSTOM_K else VALVE_K[valve], n_f, kf if fitting == CUSTOM_K else FITTING_K[fitting],
@@ -981,6 +1059,11 @@ def render() -> None:
                 "Share of drop": [round(x * 100, 1) for x in r.share]}),
                 hide_index=True, width="stretch",
                 column_config={"Share of drop": st.column_config.ProgressColumn("Share of drop (%)", min_value=0, max_value=100, format="%.1f")})
+            d1, d2 = st.columns(2)
+            d1.download_button("Download sections (CSV)", sections_csv(r, system), "pump_pipe_sections.csv", "text/csv",
+                               key="pp_dl_sections")
+            d2.download_button("Download curves (CSV)", curves_csv(r, system), "pump_pipe_curves.csv", "text/csv",
+                               key="pp_dl_curves")
 
             st.subheader("Energy and cost at the operating point")
             en = validate_energy(EnergyInputs(hours, price, eta_m / 100, eta_v / 100))

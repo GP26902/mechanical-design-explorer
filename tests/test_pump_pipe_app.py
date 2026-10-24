@@ -1,5 +1,6 @@
 from pathlib import Path
 import pytest
+from chapters import pump_pipe as pp_mod
 
 from streamlit.testing.v1 import AppTest
 
@@ -155,3 +156,27 @@ def test_custom_fluid_disables_temperature_and_flags_bad_values():
     assert not at.exception and any("Density" in e.value for e in at.error)
     at.sidebar.radio(key="unit_system").set_value("US").run()
     assert not at.exception
+
+
+@pytest.mark.parametrize("name", list(pp_mod.EXAMPLES))
+def test_every_example_loads_in_the_app_with_the_same_flow_as_the_calculation(name):
+    at = _run()
+    if name != pp_mod.DEFAULT_EXAMPLE:
+        at.selectbox(key="pp_example").set_value(name).run()
+    assert not at.exception and not any("Input problem" in e.value for e in at.error)   # the cavitation box is also an error element
+    lay, pump, temp, fluid = pp_mod.build_example(name)
+    q = pp_mod.analyse(lay, pump, 1750.0, temp, fluid=fluid).q_op * 1000
+    assert _q(at) == pytest.approx(q, rel=1e-2)                                 # 3 significant digits shown
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception and not any("Input problem" in e.value for e in at.error)   # the cavitation box is also an error element
+
+
+def test_example_inputs_stay_editable_and_downloads_are_offered():
+    at = _run()
+    assert len(at.get("download_button")) == 2
+    at.selectbox(key="pp_example").set_value("Undersized discharge pipe").run()
+    q_small = _q(at)
+    at.slider(key="pp_dd_e1_SI").set_value(100.0).run()                         # widen the pipe back to 100 mm
+    assert not at.exception and _q(at) > 1.5 * q_small
+    at.selectbox(key="pp_example").set_value(pp_mod.DEFAULT_EXAMPLE).run()
+    assert not at.exception and at.slider(key="pp_dd_SI").value == 100.0
