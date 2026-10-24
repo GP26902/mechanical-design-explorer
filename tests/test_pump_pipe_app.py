@@ -17,7 +17,7 @@ def test_chapter_loads_standalone_with_disclaimer_and_results():
     at = _run()
     assert not at.exception
     assert any("not certified design" in w.value for w in at.warning)
-    assert _labels(at) == ["Operating flow", "Pump head", "Largest pressure drop", "NPSH margin"]
+    assert _labels(at)[:4] == ["Operating flow", "Pump head", "Largest pressure drop", "NPSH margin"]
     assert at.metric[2].value == "Discharge pipe"                          # default bottleneck
     assert any("No cavitation expected" in s.value for s in at.success)
     assert "L/s" in at.metric[0].value and "m" in at.metric[1].value
@@ -65,3 +65,24 @@ def test_us_units_and_velocity_colouring_do_not_crash():
     assert not at.exception
     assert "gpm" in at.metric[0].value
     assert not any("Input problem" in e.value or "unexpected" in e.value for e in at.error)
+
+
+def test_energy_and_control_section_shows_and_responds():
+    at = _run()
+    assert not at.exception
+    assert _labels(at)[4:] == ["Pump efficiency", "Shaft power", "Electrical input", "Energy cost per year",
+                                "Throttle valve, electrical", "Variable speed, electrical", "Power saved", "Saved per year"]
+    assert "kW" in at.metric[5].value and at.metric[7].value.startswith("$")
+    saved_70 = float(at.metric[11].value.lstrip("$").replace(",", ""))
+    at.slider(key="pp_target").set_value(40).run()
+    assert not at.exception and float(at.metric[11].value.lstrip("$").replace(",", "")) > saved_70   # lower flow, bigger saving
+
+
+def test_energy_section_in_us_units_and_hidden_without_operating_point():
+    at = _run()
+    at.sidebar.radio(key="unit_system").set_value("US").run()
+    assert not at.exception and "hp" in at.metric[5].value
+    at = _run()
+    at.number_input(key="pp_h0_SI").set_value(31.0).run()
+    at.slider(key="pp_zd_SI").set_value(40.0).run()
+    assert not at.exception and "Pump efficiency" not in _labels(at)

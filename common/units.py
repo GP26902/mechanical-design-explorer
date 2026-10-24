@@ -21,6 +21,7 @@ UNITS: dict[str, dict[str, tuple[str, float]]] = {
     "stress":       {SI: ("MPa", 1e6),   US: ("ksi", 6.894757293168e6)},
     "flow":         {SI: ("L/s", 1e-3),  US: ("gpm", 6.30901964e-5)},
     "velocity":     {SI: ("m/s", 1.0),   US: ("ft/s", 0.3048)},
+    "power":        {SI: ("kW", 1e3),    US: ("hp", 745.69987158227)},   # mechanical horsepower
 }
 
 

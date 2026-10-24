@@ -4,7 +4,9 @@ Method (no CFD claims): one-dimensional system-curve analysis. Pipe friction fro
 a laminar / Colebrook-White friction factor, fitting losses from loss coefficients K, a quadratic
 centrifugal pump curve scaled with the affinity laws, and the operating point where pump head equals
 system head. Bottleneck = section with the largest pressure drop. Cavitation screening compares NPSH
-available with NPSH required. Water only. Pump data and loss coefficients are illustrative.
+available with NPSH required. Energy: hydraulic power rho g Q H, an assumed efficiency curve through the best
+efficiency point, motor and drive efficiencies, and a throttle-valve vs variable-speed-drive comparison at a
+reduced target flow. Water only. Pump data and loss coefficients are illustrative.
 """
 import sys
 from pathlib import Path
@@ -31,13 +33,16 @@ TITLE = "2 · Pump & pipe system"
 KEY_PREFIX = "pp_"
 ABOUT = """**Method.** System-curve analysis, not CFD: Darcy-Weisbach friction with a laminar or Colebrook-White friction factor, fitting losses from loss coefficients, and a quadratic pump curve scaled with the affinity laws. The operating point is where the pump curve meets the system curve. Cavitation risk compares NPSH available with NPSH required.
 
-**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance.
+**Energy.** Hydraulic power is ρgQH. Pump efficiency follows an assumed curve (η = η_BEP (2x − x²), x = flow / best-efficiency flow, with the best-efficiency flow taken as the design flow) that keeps the same shape under the affinity laws. Shaft and electrical power follow from it and from the motor efficiency. A throttle-valve vs variable-speed-drive comparison at a lower flow shows the head the valve wastes and the power and yearly cost the drive saves.
 
-**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. Pump efficiency and power, water hammer, two-phase flow and parallel branches are not modelled.
+**Checked in pytest:** laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; system head by hand; affinity laws; operating point; NPSH and cavitation thresholds; water vapour pressure; energy balance; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against the closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout.
+
+**Limitations:** one series path, one pipe material, water at sea-level pressure. Loss coefficients are rounded textbook values. The efficiency curve shape and the constant motor and drive efficiencies are assumptions, not manufacturer data. Water hammer, two-phase flow and parallel branches are not modelled.
 
 For learning and screening, not certified design."""
 DESCRIPTION = ("Darcy-Weisbach pipe and fitting losses against a centrifugal pump curve: operating point, "
-               "bottleneck section and NPSH cavitation check (system-curve analysis, not CFD).")
+               "bottleneck section, NPSH cavitation check, and pump power and energy cost with a throttle vs "
+               "variable-speed comparison (system-curve analysis, not CFD).")
 
 # =============================================================================================
 # CALCULATIONS (pure functions, SI units in and out, no Streamlit)
@@ -182,6 +187,7 @@ class PumpData:
     h_design: float
     npshr_design: float         # NPSH required at the design flow, m
     rpm_rated: float
+    eta_bep: float = 0.75       # pump efficiency at the best-efficiency (= design) flow, assumed
 
     def a(self) -> float:
         return (self.h_shutoff - self.h_design) / self.q_design**2
@@ -194,6 +200,7 @@ def validate_pump(p: PumpData) -> PumpData:
                       _finite(p.h_shutoff, "Pump shutoff head"), "shutoff head")
     require_positive(_finite(p.npshr_design, "NPSH required"), "NPSH required")
     require_positive(_finite(p.rpm_rated, "Rated speed"), "Rated speed")
+    require_in_range(_finite(p.eta_bep, "Best pump efficiency"), "Best pump efficiency", 1e-6, 1.0)
     return p
 
 
@@ -217,6 +224,17 @@ def pump_npshr(p: PumpData, Q, r: float = 1.0):
     Q = np.asarray(Q, dtype=float)
     r0 = 0.5 * p.npshr_design
     return r**2 * r0 + (p.npshr_design - r0) * (Q / p.q_design) ** 2
+
+
+ETA_FLOOR = 0.05                # efficiency is never taken below 5 % (keeps power finite at very low or very high flow)
+BEP_LOW, BEP_HIGH = 0.7, 1.2    # usual preferred operating range, fraction of best-efficiency flow (rule of thumb)
+
+
+def pump_efficiency(p: PumpData, Q, r: float = 1.0):
+    """Assumed efficiency curve eta = eta_bep (2x - x^2), x = Q / (r Q_design). Peaks at eta_bep when x = 1 and, because
+    x uses the speed-scaled flow, keeps its shape under the affinity laws. Floored at ETA_FLOOR."""
+    x = np.asarray(Q, dtype=float) / (r * p.q_design)
+    return np.maximum(p.eta_bep * (2.0 * x - x**2), ETA_FLOOR)
 
 
 # ---- sections, system curve, operating point -------------------------------------------------
@@ -355,6 +373,83 @@ def analyse(L: Layout, pump: PumpData, rpm: float, temp_c: float = 20.0, n_point
             prof.append(node(s.name, head, 0.0 if s.name == "Discharge exit" else s.velocity))
     return Result(fl, r, static_head(L), q, h_pump, h_sys, npsha_c, npshr_c, q_op, h_op, secs, dp, share,
                   bottleneck, na, nr, cavitation_status(na, nr), trans, prof)
+
+
+# ---- power, energy cost, throttle vs variable speed -----------------------------------------
+@dataclass(frozen=True)
+class EnergyInputs:
+    hours_per_year: float
+    price_per_kwh: float
+    eta_motor: float
+    eta_vfd: float = 0.97
+
+
+def validate_energy(e: EnergyInputs) -> EnergyInputs:
+    require_in_range(_finite(e.hours_per_year, "Running hours per year"), "Running hours per year", 1.0, 8760.0)
+    require_non_negative(_finite(e.price_per_kwh, "Electricity price"), "Electricity price")
+    require_in_range(_finite(e.eta_motor, "Motor efficiency"), "Motor efficiency", 1e-6, 1.0)
+    require_in_range(_finite(e.eta_vfd, "Drive efficiency"), "Drive efficiency", 1e-6, 1.0)
+    return e
+
+
+@dataclass(frozen=True)
+class PowerResult:
+    eta: float          # pump efficiency
+    hydraulic: float    # W, rho g Q H
+    shaft: float        # W, hydraulic / eta
+    electrical: float   # W, shaft / (motor efficiency x drive efficiency)
+
+
+def operating_power(p: PumpData, Q: float, H: float, r: float, rho: float, eta_motor: float,
+                    eta_drive: float = 1.0) -> PowerResult:
+    eta = float(pump_efficiency(p, Q, r))
+    hyd = rho * G * Q * H
+    shaft = hyd / eta
+    return PowerResult(eta, hyd, shaft, shaft / (eta_motor * eta_drive))
+
+
+def annual_energy(power_w: float, hours_per_year: float, price_per_kwh: float) -> tuple:
+    """(kWh per year, cost per year) for a constant electrical power."""
+    kwh = power_w / 1000.0 * hours_per_year
+    return kwh, kwh * price_per_kwh
+
+
+@dataclass(frozen=True)
+class ControlResult:
+    q_target: float             # m^3/s
+    h_system: float             # m, head the system needs at q_target
+    h_pump_throttle: float      # m, head the pump delivers at q_target at the current speed
+    h_valve: float              # m, head the throttle valve has to burn
+    ratio_vfd: float            # speed ratio (to rated) that delivers q_target with no valve
+    rpm_vfd: float
+    throttle: PowerResult
+    vfd: PowerResult
+    saving_w: float             # electrical, throttle minus VFD
+    saving_frac: float
+    kwh_throttle: float
+    kwh_vfd: float
+    cost_throttle: float
+    cost_vfd: float
+
+
+def compare_control(r: Result, L: Layout, pump: PumpData, frac: float, energy: EnergyInputs) -> ControlResult:
+    """Deliver frac x (operating flow) two ways: (1) throttle valve, pump stays at the current speed; (2) variable-speed drive,
+    no valve. VFD speed from H_sys(Q) = ratio^2 H0 - a Q^2, i.e. ratio = sqrt((H_sys + a Q^2) / H0)."""
+    validate_energy(energy)
+    if r.q_op is None:
+        raise ValidationError("There is no operating point to compare against.")
+    require_in_range(_finite(frac, "Target flow fraction"), "Target flow fraction", 0.05, 1.0)
+    q = frac * r.q_op
+    h_sys = system_head(q, L, r.fluid)
+    h_thr = float(pump_head(pump, q, r.ratio))
+    ratio_v = math.sqrt((h_sys + pump.a() * q**2) / pump.h_shutoff)
+    thr = operating_power(pump, q, h_thr, r.ratio, r.fluid.rho, energy.eta_motor)
+    vfd = operating_power(pump, q, h_sys, ratio_v, r.fluid.rho, energy.eta_motor, energy.eta_vfd)
+    kt, ct = annual_energy(thr.electrical, energy.hours_per_year, energy.price_per_kwh)
+    kv, cv = annual_energy(vfd.electrical, energy.hours_per_year, energy.price_per_kwh)
+    return ControlResult(q, h_sys, h_thr, max(h_thr - h_sys, 0.0), ratio_v, ratio_v * pump.rpm_rated, thr, vfd,
+                         thr.electrical - vfd.electrical, (thr.electrical - vfd.electrical) / thr.electrical,
+                         kt, kv, ct, cv)
 
 
 # =============================================================================================
@@ -528,6 +623,56 @@ def npsh_figure(r: Result, system: str) -> go.Figure:
     return fig
 
 
+def efficiency_figure(r: Result, pump: PumpData, system: str) -> go.Figure:
+    qu = units.label("flow", system)
+    Lq = lambda v: units.from_si(v, "flow", system)
+    q_bep = r.ratio * pump.q_design
+    x_op = r.q_op / q_bep
+    inside = BEP_LOW <= x_op <= BEP_HIGH
+    fig = go.Figure()
+    fig.add_vrect(x0=float(Lq(BEP_LOW * q_bep)), x1=float(Lq(BEP_HIGH * q_bep)), fillcolor="rgba(46,125,50,0.12)",
+                  line_width=0, annotation_text="usual preferred range (70–120 % of BEP flow)",
+                  annotation_position="top left", annotation_font_size=11)
+    xq = r.q / q_bep
+    raw = pump.eta_bep * (2 * xq - xq**2)                               # hide the 5 % floor so the curve ends where it falls to it
+    fig.add_trace(go.Scatter(x=Lq(r.q), y=np.where(raw > ETA_FLOOR, 100 * pump_efficiency(pump, r.q, r.ratio), np.nan), mode="lines",
+                             name="Pump efficiency (assumed shape)", line=dict(color=ACCENT, width=3)))
+    fig.add_trace(go.Scatter(x=[Lq(r.q_op)], y=[100 * float(pump_efficiency(pump, r.q_op, r.ratio))], mode="markers",
+                             name="Operating point", marker=dict(size=14, color=PASS_COLOR if inside else AMBER,
+                                                                 line=dict(width=2, color="#222"))))
+    apply_theme(fig, "Pump efficiency at this speed (assumed curve, not manufacturer data)", 320)
+    fig.update_xaxes(title=f"Flow ({qu})", rangemode="tozero")
+    fig.update_yaxes(title="Efficiency (%)", range=[0, 100 * pump.eta_bep * 1.2])
+    fig.update_layout(legend=dict(orientation="h", y=-0.3))
+    return fig
+
+
+def control_figure(c: ControlResult, r: Result, pump: PumpData, system: str) -> go.Figure:
+    qu, hu = units.label("flow", system), units.label("length_long", system)
+    Lq, Lh = (lambda v: units.from_si(v, "flow", system)), (lambda v: units.from_si(v, "length_long", system))
+    qv = np.linspace(0.0, pump_q_max(pump, c.ratio_vfd), 100)
+    q = float(Lq(c.q_target))
+    fig = go.Figure([
+        go.Scatter(x=Lq(r.q), y=Lh(r.h_sys), mode="lines", name="System curve", line=dict(color="#d97706", width=3)),
+        go.Scatter(x=Lq(r.q), y=Lh(r.h_pump), mode="lines", name="Pump, current speed", line=dict(color=ACCENT, width=3)),
+        go.Scatter(x=Lq(qv), y=Lh(pump_head(pump, qv, c.ratio_vfd)), mode="lines", name="Pump, variable speed",
+                   line=dict(color=PASS_COLOR, width=3, dash="dash"))])
+    fig.add_shape(type="line", x0=q, x1=q, y0=float(Lh(c.h_system)), y1=float(Lh(c.h_pump_throttle)),
+                  line=dict(color=FAIL_COLOR, width=4))
+    fig.add_annotation(x=q, y=float(Lh((c.h_system + c.h_pump_throttle) / 2)), xanchor="left", showarrow=False, xshift=8,
+                       text=f"<b>valve burns {float(Lh(c.h_valve)):.1f} {hu}</b>", font=dict(color=FAIL_COLOR, size=12),
+                       bgcolor="rgba(128,128,128,0.18)")
+    fig.add_trace(go.Scatter(x=[q], y=[float(Lh(c.h_pump_throttle))], mode="markers", name="Throttled point",
+                             marker=dict(size=13, color=AMBER, line=dict(width=2, color="#222"))))
+    fig.add_trace(go.Scatter(x=[q], y=[float(Lh(c.h_system))], mode="markers", name="Variable-speed point",
+                             marker=dict(size=13, color=PASS_COLOR, line=dict(width=2, color="#222"))))
+    apply_theme(fig, f"Same flow ({q:.1f} {qu}): throttle valve vs variable speed", 400)
+    fig.update_xaxes(title=f"Flow ({qu})", rangemode="tozero")
+    fig.update_yaxes(title=f"Head ({hu})", range=[0, 1.25 * float(Lh(r.h_pump.max()))])
+    fig.update_layout(legend=dict(orientation="h", y=-0.25))
+    return fig
+
+
 # =============================================================================================
 # UI
 # =============================================================================================
@@ -535,6 +680,13 @@ def _slider(label, kind, lo, hi, default, key, system):
     lo_u, hi_u, d_u = (units.from_si(v, kind, system) for v in (lo, hi, default))
     v = slider_box(f"{label} ({units.label(kind, system)})", lo_u, hi_u, d_u, f"{key}_{system}")
     return units.to_si(v, kind, system)
+
+
+def _metric(col, label: str, value: str, note: str = "") -> None:
+    """Metric with a plain caption underneath (st.metric's delta would draw a misleading up-arrow)."""
+    col.metric(label, value)
+    if note:
+        col.caption(note)
 
 
 def _num(label, kind, default, key, system, step_si, fmt="%.2f"):
@@ -573,12 +725,22 @@ def render() -> None:
             hd = _num("Head at design flow", "length_long", 30.0, "pp_hd", system, 0.5, "%.1f")
             nr = _num("NPSH required at design flow", "length_long", 3.5, "pp_nr", system, 0.1, "%.1f")
             rpm_rated = st.number_input("Rated speed (rpm)", value=1750.0, step=50.0, key="pp_rpm_rated")
+            eta_bep = st.number_input("Best efficiency, at design flow (%)", 1.0, 100.0, 75.0, 1.0, key="pp_eta_bep",
+                                      format="%.0f", help="Assumed efficiency curve peaks here; not manufacturer data.")
         color_by = st.radio("Colour the layout by", ["pressure", "velocity"], format_func=str.capitalize,
                             horizontal=True, key="pp_color")
         st.caption(f"Pump speed: {pct / 100 * rpm_rated:,.0f} rpm")
+        st.subheader("Energy and control")
+        target = st.slider("Flow actually needed (% of the operating flow)", 30, 100, 70, key="pp_target",
+                           help="Compares a throttle valve with a variable-speed drive at this lower flow.")
+        with st.expander("Energy cost inputs (illustrative)"):
+            hours = st.number_input("Running hours per year", 1.0, 8760.0, 4000.0, 100.0, key="pp_hours", format="%.0f")
+            price = st.number_input("Electricity price ($/kWh)", 0.0, 5.0, 0.10, 0.01, key="pp_price", format="%.3f")
+            eta_m = st.number_input("Motor efficiency (%)", 1.0, 100.0, 92.0, 1.0, key="pp_eta_motor", format="%.0f")
+            eta_v = st.number_input("Drive (VFD) efficiency (%)", 1.0, 100.0, 97.0, 1.0, key="pp_eta_vfd", format="%.0f")
 
     lay = Layout(d_s, l_s, d_d, l_d, ROUGHNESS[mat], z_s, z_d, n_b, n_v, VALVE_K[valve], n_f, FITTING_K[fitting])
-    pump = PumpData(h0, qd, hd, nr, rpm_rated)
+    pump = PumpData(h0, qd, hd, nr, rpm_rated, eta_bep / 100)
     r = analyse(lay, pump, pct / 100 * rpm_rated, float(temp))
 
     with right:
@@ -613,6 +775,33 @@ def render() -> None:
                 "Share of drop": [round(x * 100, 1) for x in r.share]}),
                 hide_index=True, width="stretch",
                 column_config={"Share of drop": st.column_config.ProgressColumn("Share of drop (%)", min_value=0, max_value=100, format="%.1f")})
+
+            st.subheader("Energy and cost at the operating point")
+            en = validate_energy(EnergyInputs(hours, price, eta_m / 100, eta_v / 100))
+            pw = operating_power(pump, r.q_op, r.h_op, r.ratio, r.fluid.rho, en.eta_motor)
+            kwh, cost = annual_energy(pw.electrical, en.hours_per_year, en.price_per_kwh)
+            x_bep = r.q_op / (r.ratio * pump.q_design)
+            e1, e2, e3, e4 = st.columns(4)
+            _metric(e1, "Pump efficiency", f"{pw.eta * 100:.0f} %", f"at {x_bep * 100:.0f} % of best-efficiency flow")
+            _metric(e2, "Shaft power", units.fmt(pw.shaft, "power", system, 3))
+            _metric(e3, "Electrical input", units.fmt(pw.electrical, "power", system, 3))
+            _metric(e4, "Energy cost per year", f"${cost:,.0f}", f"{kwh:,.0f} kWh per year")
+            if not BEP_LOW <= x_bep <= BEP_HIGH:
+                st.warning(f"Operating at {x_bep * 100:.0f} % of the best-efficiency flow, outside the usual 70–120 % range "
+                           "(rule of thumb): efficiency drops there and wear typically rises.")
+            st.plotly_chart(efficiency_figure(r, pump, system), width="stretch")
+
+            st.subheader("Throttle valve vs variable-speed drive")
+            c = compare_control(r, lay, pump, target / 100, en)
+            st.caption(f"To deliver {units.fmt(c.q_target, 'flow', system, 3)} ({target} % of the operating flow), a throttle "
+                       f"valve has to burn {units.fmt(c.h_valve, 'length_long', system, 3)} of head. A variable-speed drive "
+                       f"runs the pump at {c.rpm_vfd:,.0f} rpm ({c.ratio_vfd * 100:.0f} % of rated) instead.")
+            s1, s2, s3, s4 = st.columns(4)
+            _metric(s1, "Throttle valve, electrical", units.fmt(c.throttle.electrical, "power", system, 3), f"${c.cost_throttle:,.0f} per year")
+            _metric(s2, "Variable speed, electrical", units.fmt(c.vfd.electrical, "power", system, 3), f"${c.cost_vfd:,.0f} per year")
+            _metric(s3, "Power saved", units.fmt(c.saving_w, "power", system, 3), f"{c.saving_frac * 100:.0f} % of the throttle power")
+            _metric(s4, "Saved per year", f"${c.cost_throttle - c.cost_vfd:,.0f}", f"{c.kwh_throttle - c.kwh_vfd:,.0f} kWh per year")
+            st.plotly_chart(control_figure(c, r, pump, system), width="stretch")
         with st.expander("Method and limits"):
             st.markdown(
                 "- Series system: suction tank → entrance → suction pipe → pump → discharge pipe with bends, valves and fittings "
@@ -626,8 +815,14 @@ def render() -> None:
                 "- Bottleneck: the section with the largest pressure drop at the operating point.\n"
                 "- Cavitation screening: NPSH available = (P_atm − P_vapour)/ρg + suction level − suction losses, at sea-level "
                 "pressure. Flagged \"marginal\" below 1.3 × NPSH required.\n"
+                "- Power: hydraulic ρgQH; shaft = hydraulic / η; electrical = shaft / (motor × drive efficiency). Pump efficiency "
+                "η = η_BEP (2x − x²), x = Q / (speed ratio × design flow), is an assumed shape (floored at 5 %), not manufacturer data. "
+                "Motor and drive efficiencies are held constant. Yearly cost = kWh × price at constant running conditions.\n"
+                "- Throttle vs variable speed: both deliver the same lower flow. Throttle: pump stays at the current speed and the "
+                "valve burns the surplus head. Variable speed: speed ratio = √((H_sys + aQ²)/H₀), no valve. At 100 % of the flow the "
+                "drive saves nothing and its own losses make it slightly worse.\n"
                 "- Pressure colours are gauge pressure referred to the pump-centreline elevation; pipe elevation changes, "
-                "pump efficiency and power, water hammer, two-phase flow and parallel branches are not modelled.")
+                "water hammer, two-phase flow and parallel branches are not modelled.")
 
 
 if __name__ == "__main__":
