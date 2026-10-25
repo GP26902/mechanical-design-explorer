@@ -1,8 +1,9 @@
 """Chapter 4: Basic tools & examples. Small calculators the other chapters rely on.
 
-Step 1 tabs: units and validation demos, and thread and fastener sizes (ISO metric and UNC/UNF). Calculations are pure
-functions (no Streamlit). Thread standards are tabulated in their own units, so thread dimensions are in mm (metric)
-or inch (inch series), named accordingly, rather than SI metres.
+Tabs: units and validation demos; thread and fastener sizes (ISO metric and UNC/UNF); pipe sizes (ASME B36.10, schedule 40
+and 80); wall thickness under internal pressure (thin-wall and Lame thick-wall); thickness sensitivity of a cantilever
+plate. Calculations are pure functions (no Streamlit). Thread and pipe standards are tabulated in their own units, so
+those dimensions are in mm (or inch for the inch threads), named accordingly; the other functions are SI in, SI out.
 """
 import sys
 from pathlib import Path
@@ -14,27 +15,34 @@ from dataclasses import dataclass
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 from common import units
 from common.theme import ACCENT, FAIL_COLOR, PASS_COLOR, apply_theme
-from common.ui import get_unit_system, run_standalone
-from common.validation import ValidationError, require_less_than, require_positive
+from common.ui import get_unit_system, run_standalone, slider_box
+from common.validation import ValidationError, require_less_than, require_non_negative, require_positive
 
 TITLE = "4 · Basic tools & examples"
-DESCRIPTION = ("Small calculators the other chapters rely on: unit and validation demos, and ISO metric and UNC/UNF "
-               "thread and fastener sizes with clearance holes and the floating-fastener position tolerance.")
+DESCRIPTION = ("Small calculators the other chapters rely on: unit and validation demos, ISO metric and UNC/UNF thread "
+               "sizes with clearance holes, pipe sizes, wall thickness under pressure and plate thickness sensitivity.")
 ORDER = 90          # listed after chapters 1 to 3 (they use the default, 50)
 KEY_PREFIX = "bt_"
 ABOUT = """**Method.** Each tab is a small closed-form calculator or a lookup of published standard values, shown with the formula it uses.
 
 **Threads & fasteners.** ISO metric (60° thread) basic geometry from the pitch P: pitch diameter d₂ = d − (3√3/8)P, external minor diameter d₃ = d − (17√3/24)P, internal minor diameter D₁ = d − (5√3/8)P, and the tensile stress area A_s = (π/4)((d₂ + d₃)/2)² = (π/4)(d − 0.9382 P)² (the ISO 898-1 definition). Unified inch threads (UNC and UNF) use A_s = (π/4)(D − 0.9743/n)² with n threads per inch. The approximate tap drill is d − P. Clearance holes are the close and normal series of ASME B18.2.8, which follow ISO 273 (fine and medium). The floating-fastener position tolerance is T = H − F, the same formula as Chapter 3, with H the smallest clearance hole and F the nominal fastener diameter.
 
+**Pipe sizes.** Outside diameter and wall thickness of NPS 1/2 to 8 steel pipe, schedule 40 and 80 (ASME B36.10M, millimetre values). Inside diameter = OD − 2 × wall, flow area = (π/4) ID², and the mean velocity at a flow Q is v = Q/A. Use the inside diameter as the pipe diameter in Chapter 2.
+
+**Wall thickness under pressure.** Thin-wall (membrane) stresses for internal pressure p, inside diameter D_i and wall t: hoop σ_h = pD_i/(2t), axial (closed ends) σ_a = pD_i/(4t). The thick-wall (Lamé) inner-surface hoop stress is σ_h = p(r_o² + r_i²)/(r_o² − r_i²), radial σ_r = −p, axial σ_a = p r_i²/(r_o² − r_i²). The required wall for an allowable stress S is t = pD_i/(2S) (thin) or t = r_i(√((S + p)/(S − p)) − 1) (Lamé), plus the corrosion allowance; stresses are computed on the wall left after the corrosion allowance. This is a stress screening of a plain cylinder, not a pressure-vessel or piping code design.
+
+**Thickness sensitivity.** Cantilever plate of width b, length L and thickness t with a tip load P: deflection δ = 4PL³/(Ebt³), stiffness k = P/δ = Ebt³/(4L³), root stress σ = 6PL/(bt²). Deflection falls with the cube of the thickness and stress with its square. Beam theory assumes a long plate (L/t of about 10 or more) and small deflections; the tab warns otherwise.
+
 **Units & validation.** The circle-area demo and two small cases (a hollow tube and a simply supported beam) show how impossible inputs get a clear message instead of a crash.
 
-**Checked in pytest:** the thread geometry formulas by hand; tensile stress areas against the published ISO 898-1 table (coarse and fine pitches) and the UN tables (UNC and UNF); the clearance-hole tables for consistency; T = H − F by hand; every input check.
+**Checked in pytest:** the thread geometry formulas by hand; tensile stress areas against the published ISO 898-1 table (coarse and fine pitches) and the UN tables (UNC and UNF); the clearance-hole tables for consistency; T = H − F by hand; pipe inside diameters, flow area and velocity by hand; thin-wall and Lamé stresses and required walls by hand, including the round trip (a wall sized for S gives exactly S); cantilever deflection, stiffness and root stress by hand with the cube and square laws; every input check.
 
-**Limitations:** nominal dimensions only (no tolerance classes such as 6g/6H), no proof or tensile loads, and a limited list of sizes (M3 to M30, #4 to 1-1/4 in). Charts from other sources round some medium clearance holes differently (for example M12 and M16). Values are for learning and screening: confirm them against the standard before using them for real work.
+**Limitations:** nominal dimensions only (no tolerance classes such as 6g/6H or manufacturing tolerances on pipe wall), no proof or tensile loads, and a limited list of sizes (M3 to M30, #4 to 1-1/4 in, NPS 1/2 to 8). Pipe dimensions are carbon-steel B36.10M values; stainless pipe (B36.19M) differs for some schedules and sizes. The wall-thickness tab ignores weld joint efficiency, temperature, external pressure, bends and the piping and pressure-vessel codes. The plate tab uses linear beam theory. Charts from other sources round some medium clearance holes differently (for example M12 and M16). Values are for learning and screening: confirm them against the standard before using them for real work.
 
 For learning and screening, not certified design."""
 
@@ -137,6 +145,97 @@ def floating_fastener_tolerance_mm(hole_mm: float, fastener_mm: float) -> float:
         raise ValidationError(f"The hole ({hole_mm:g} mm) is smaller than the fastener ({fastener_mm:g} mm): "
                               "the fastener would not fit.")
     return hole_mm - fastener_mm
+
+
+# NPS -> (outside diameter mm, schedule 40 wall mm, schedule 80 wall mm), carbon steel, ASME B36.10M
+PIPE_SIZES = {"1/2": (21.3, 2.77, 3.73), "3/4": (26.7, 2.87, 3.91), "1": (33.4, 3.38, 4.55), "1-1/4": (42.2, 3.56, 4.85),
+              "1-1/2": (48.3, 3.68, 5.08), "2": (60.3, 3.91, 5.54), "2-1/2": (73.0, 5.16, 7.01), "3": (88.9, 5.49, 7.62),
+              "3-1/2": (101.6, 5.74, 8.08), "4": (114.3, 6.02, 8.56), "5": (141.3, 6.55, 9.53), "6": (168.3, 7.11, 10.97),
+              "8": (219.1, 8.18, 12.70)}
+SCHEDULES = (40, 80)
+MATERIAL_E_GPA = {"Steel (typical)": 200.0, "Aluminium (typical)": 69.0, "Titanium (typical)": 114.0}
+
+
+@dataclass(frozen=True)
+class PipeSize:
+    nps: str
+    schedule: int
+    od_mm: float
+    wall_mm: float
+    id_mm: float
+    flow_area_m2: float
+
+
+def pipe_size(nps: str, schedule: int) -> PipeSize:
+    if nps not in PIPE_SIZES:
+        raise ValidationError(f"NPS {nps} is not in the table (NPS 1/2 to 8).")
+    if schedule not in SCHEDULES:
+        raise ValidationError("The schedule must be 40 or 80.")
+    od, w40, w80 = PIPE_SIZES[nps]
+    wall = w40 if schedule == 40 else w80
+    id_mm = od - 2 * wall
+    return PipeSize(nps, schedule, od, wall, id_mm, math.pi / 4 * (id_mm / 1000) ** 2)
+
+
+def pipe_velocity_m_s(flow_m3s: float, id_mm: float) -> float:
+    """Mean velocity v = Q / A in a full pipe of the given inside diameter."""
+    require_positive(flow_m3s, "Flow")
+    require_positive(id_mm, "Inside diameter")
+    return flow_m3s / (math.pi / 4 * (id_mm / 1000) ** 2)
+
+
+@dataclass(frozen=True)
+class WallStress:
+    hoop_thin: float        # Pa, p Di / (2 t)
+    axial_thin: float       # Pa, p Di / (4 t)
+    hoop_thick: float       # Pa, Lame, inner surface (the largest)
+    radial_inner: float     # Pa, -p at the inner surface
+    axial_thick: float      # Pa, Lame, closed ends
+    d_over_t: float
+
+
+def wall_stresses(p_pa: float, di_m: float, t_m: float) -> WallStress:
+    """Stresses in a cylinder with internal gauge pressure p, inside diameter Di and wall t (closed ends for the axial stress)."""
+    require_positive(p_pa, "Pressure")
+    require_positive(di_m, "Inside diameter")
+    require_positive(t_m, "Wall thickness")
+    ri = di_m / 2
+    ro = ri + t_m
+    return WallStress(p_pa * ri / t_m, p_pa * ri / (2 * t_m), p_pa * (ro**2 + ri**2) / (ro**2 - ri**2), -p_pa,
+                      p_pa * ri**2 / (ro**2 - ri**2), di_m / t_m)
+
+
+def required_wall_thin_m(p_pa: float, di_m: float, allowable_pa: float, corrosion_m: float = 0.0) -> float:
+    """t = p Di / (2 S) + corrosion allowance."""
+    for v, n in ((p_pa, "Pressure"), (di_m, "Inside diameter"), (allowable_pa, "Allowable stress")):
+        require_positive(v, n)
+    require_non_negative(corrosion_m, "Corrosion allowance")
+    return p_pa * di_m / (2 * allowable_pa) + corrosion_m
+
+
+def required_wall_thick_m(p_pa: float, di_m: float, allowable_pa: float, corrosion_m: float = 0.0) -> float:
+    """Lame: the inner hoop stress equals S when r_o = r_i sqrt((S + p) / (S - p)); plus the corrosion allowance."""
+    for v, n in ((p_pa, "Pressure"), (di_m, "Inside diameter"), (allowable_pa, "Allowable stress")):
+        require_positive(v, n)
+    require_non_negative(corrosion_m, "Corrosion allowance")
+    if allowable_pa <= p_pa:
+        raise ValidationError("The allowable stress must be greater than the pressure: no wall thickness can carry it.")
+    return di_m / 2 * (math.sqrt((allowable_pa + p_pa) / (allowable_pa - p_pa)) - 1) + corrosion_m
+
+
+@dataclass(frozen=True)
+class PlateResult:
+    deflection_m: float
+    stiffness_n_per_m: float
+    root_stress_pa: float
+
+
+def cantilever_plate(load_n: float, length_m: float, width_m: float, thickness_m: float, e_pa: float) -> PlateResult:
+    """Tip-loaded cantilever plate (linear beam theory): delta = 4 P L^3 / (E b t^3), sigma = 6 P L / (b t^2)."""
+    for v, n in ((load_n, "Load"), (length_m, "Length"), (width_m, "Width"), (thickness_m, "Thickness"), (e_pa, "Young's modulus")):
+        require_positive(v, n)
+    delta = 4 * load_n * length_m**3 / (e_pa * width_m * thickness_m**3)
+    return PlateResult(delta, load_n / delta, 6 * load_n * length_m / (width_m * thickness_m**2))
 
 
 def coarse_series_rows() -> list:
@@ -265,6 +364,157 @@ def _inch_tab() -> None:
     st.plotly_chart(fig, width="stretch")
 
 
+def _slider(label: str, kind: str, lo: float, hi: float, default: float, key: str, system: str) -> float:
+    lo_u, hi_u, d_u = (units.from_si(v, kind, system) for v in (lo, hi, default))
+    return units.to_si(slider_box(f"{label} ({units.label(kind, system)})", lo_u, hi_u, d_u, f"{key}_{system}"), kind, system)
+
+
+def _area_text(area_m2: float, system: str) -> str:
+    return f"{area_m2 * 1e6:,.0f} mm²" if system == units.SI else f"{area_m2 / 0.00064516:.2f} in²"
+
+
+def _render_pipes(system: str) -> None:
+    st.caption("Carbon-steel pipe dimensions from ASME B36.10M. Use the inside diameter as the pipe diameter in Chapter 2.")
+    c1, c2 = st.columns(2)
+    sch = c1.radio("Schedule", list(SCHEDULES), horizontal=True, key="bt_sch", format_func=lambda x: f"Sch {x}")
+    nps = c2.selectbox("Nominal pipe size (NPS, in)", list(PIPE_SIZES), index=list(PIPE_SIZES).index("2"), key="bt_nps")
+    ps = pipe_size(nps, sch)
+    a, b, c, d = st.columns(4)
+    a.metric("Outside diameter", units.fmt(ps.od_mm / 1e3, "length", system, 4))
+    b.metric("Wall thickness", units.fmt(ps.wall_mm / 1e3, "length", system, 3))
+    c.metric("Inside diameter", units.fmt(ps.id_mm / 1e3, "length", system, 4))
+    d.metric("Flow area", _area_text(ps.flow_area_m2, system))
+    q = _entry("Flow", "flow", 0.010, "bt_pipe_q", system, 0.001, "%.2f")
+    try:
+        v = pipe_velocity_m_s(q, ps.id_mm)
+    except ValidationError as exc:
+        _show_error(exc)
+    else:
+        st.metric("Mean velocity at that flow", units.fmt(v, "velocity", system, 3))
+    names = list(PIPE_SIZES)
+    fig = go.Figure()
+    for sc, col in ((40, ACCENT), (80, FAIL_COLOR)):
+        fig.add_trace(go.Bar(x=names, y=[float(units.from_si(pipe_size(n, sc).id_mm / 1e3, "length", system)) for n in names],
+                             name=f"Sch {sc}", marker_color=col, opacity=0.85))
+    fig.add_trace(go.Scatter(x=[nps], y=[float(units.from_si(ps.id_mm / 1e3, "length", system))], mode="markers", name="Selected",
+                             marker=dict(size=14, color=COLOR_AMBER, line=dict(width=2, color="#222"))))
+    apply_theme(fig, "Inside diameter by nominal pipe size", 340)
+    fig.update_xaxes(title="NPS (in)")
+    fig.update_yaxes(title=f"Inside diameter ({units.label('length', system)})")
+    fig.update_layout(barmode="group")
+    st.plotly_chart(fig, width="stretch")
+    with st.expander("Full table"):
+        rows = [{"NPS (in)": n, f"OD ({units.label('length', system)})": round(float(units.from_si(PIPE_SIZES[n][0] / 1e3, "length", system)), 3),
+                 **{f"Sch {sc} ID ({units.label('length', system)})": round(float(units.from_si(pipe_size(n, sc).id_mm / 1e3, "length", system)), 3)
+                    for sc in SCHEDULES}} for n in names]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+
+def _render_wall(system: str) -> None:
+    st.caption("Internal pressure on a plain cylinder with closed ends. A stress screening, not a pressure-vessel or piping code design. "
+               "Example inputs are illustrative.")
+    left, right = st.columns([1, 2], gap="large")
+    with left:
+        p = _entry("Internal gauge pressure", "pressure", 5.0e6, "bt_wall_p", system, 1e5, "%.1f")
+        di = _slider("Inside diameter", "length", 0.010, 0.500, 0.100, "bt_wall_di", system)
+        t = _slider("Wall thickness", "length", 0.0005, 0.050, 0.004, "bt_wall_t", system)
+        s_allow = _entry("Allowable stress", "stress", 100e6, "bt_wall_s", system, 5e6, "%.1f")
+        ca = _entry("Corrosion allowance", "length", 0.0, "bt_wall_ca", system, 0.0005, "%.2f")
+    with right:
+        try:
+            require_positive(s_allow, "Allowable stress")
+            require_non_negative(ca, "Corrosion allowance")
+            if ca >= t:
+                raise ValidationError("The corrosion allowance must be smaller than the wall thickness: nothing would be left to carry the pressure.")
+            te = t - ca
+            ws = wall_stresses(p, di, te)
+            t_thin, t_thick = required_wall_thin_m(p, di, s_allow, ca), required_wall_thick_m(p, di, s_allow, ca)
+        except ValidationError as exc:
+            _show_error(exc)
+            return
+        util = ws.hoop_thick / s_allow
+        a, b = st.columns(2)
+        a.metric("Hoop stress, thin-wall", units.fmt(ws.hoop_thin, "stress", system, 3))
+        b.metric("Hoop stress, thick-wall (Lamé)", units.fmt(ws.hoop_thick, "stress", system, 3))
+        c, d = st.columns(2)
+        c.metric("Axial stress (closed ends)", units.fmt(ws.axial_thick, "stress", system, 3))
+        d.metric("Required wall, Lamé", units.fmt(t_thick, "length", system, 3))
+        msg = (f"Hoop stress is {util * 100:.0f} % of the allowable stress. Required wall {units.fmt(t_thick, 'length', system, 3)} "
+               f"including the corrosion allowance (thin-wall formula: {units.fmt(t_thin, 'length', system, 3)}).")
+        (st.success if util <= 1 else st.error)(("Pass. " if util <= 1 else "Fail. ") + msg)
+        if ws.d_over_t < 20:
+            st.info(f"D/t = {ws.d_over_t:.1f} is below 20, so the thin-wall formula is not reliable here: the thick-wall (Lamé) value governs "
+                    f"(thin-wall is {(1 - ws.hoop_thin / ws.hoop_thick) * 100:.0f} % low).")
+        ts = [te * f for f in (0.25 + 2.75 * i / 80 for i in range(81))]
+        ri = di / 2
+        thin = [float(units.from_si(p * ri / x, "stress", system)) for x in ts]
+        thick = [float(units.from_si(p * ((ri + x) ** 2 + ri**2) / ((ri + x) ** 2 - ri**2), "stress", system)) for x in ts]
+        xs = [float(units.from_si(x + ca, "length", system)) for x in ts]
+        fig = go.Figure([go.Scatter(x=xs, y=thin, mode="lines", name="Thin-wall hoop", line=dict(color=COLOR_AMBER, width=3, dash="dash")),
+                         go.Scatter(x=xs, y=thick, mode="lines", name="Thick-wall (Lamé) hoop", line=dict(color=ACCENT, width=3))])
+        fig.add_hline(y=float(units.from_si(s_allow, "stress", system)), line=dict(color=FAIL_COLOR, dash="dot"), annotation_text="allowable stress")
+        fig.add_trace(go.Scatter(x=[float(units.from_si(t, "length", system))], y=[float(units.from_si(ws.hoop_thick, "stress", system))],
+                                 mode="markers", name="This wall", marker=dict(size=14, color=PASS_COLOR if util <= 1 else FAIL_COLOR,
+                                                                                 line=dict(width=2, color="#222"))))
+        apply_theme(fig, "Hoop stress against wall thickness", 360)
+        fig.update_xaxes(title=f"Wall thickness ({units.label('length', system)})")
+        fig.update_yaxes(title=f"Hoop stress ({units.label('stress', system)})", rangemode="tozero")
+        st.plotly_chart(fig, width="stretch")
+
+
+def _render_plate(system: str) -> None:
+    st.caption("Tip-loaded cantilever plate, linear beam theory. Deflection falls with the cube of the thickness and stress with its square. "
+               "Example inputs are illustrative.")
+    left, right = st.columns([1, 2], gap="large")
+    with left:
+        mat = st.selectbox("Material (typical Young's modulus)", list(MATERIAL_E_GPA) + ["Custom"], key="bt_plate_mat")
+        e_unit = "GPa" if system == units.SI else "Msi"
+        e_per = 1e9 if system == units.SI else 6.894757293168e9
+        e_default = (MATERIAL_E_GPA[mat] if mat != "Custom" else 100.0) * 1e9 / e_per
+        e_val = st.number_input(f"Young's modulus E ({e_unit})", value=float(e_default), step=1.0 if system == units.SI else 0.5,
+                                format="%.2f", key=f"bt_plate_E_{mat}_{system}", disabled=mat != "Custom")
+        e_pa = e_val * e_per
+        load = _entry("Tip load", "force", 100.0, "bt_plate_load", system, 10.0, "%.1f")
+        length = _slider("Length", "length", 0.050, 0.500, 0.200, "bt_plate_L", system)
+        width = _slider("Width", "length", 0.010, 0.200, 0.050, "bt_plate_b", system)
+        thick = _slider("Thickness", "length", 0.001, 0.020, 0.004, "bt_plate_t", system)
+    with right:
+        try:
+            r = cantilever_plate(load, length, width, thick, e_pa)
+            r_up = cantilever_plate(load, length, width, thick * 1.1, e_pa)
+        except ValidationError as exc:
+            _show_error(exc)
+            return
+        a, b, c = st.columns(3)
+        a.metric("Tip deflection", units.fmt(r.deflection_m, "length", system, 3))
+        b.metric("Stiffness", f"{r.stiffness_n_per_m / 1e3:,.3g} N/mm" if system == units.SI else f"{r.stiffness_n_per_m / 175.12684:,.3g} lbf/in")
+        c.metric("Root bending stress", units.fmt(r.root_stress_pa, "stress", system, 3))
+        st.info(f"A 10 % thicker plate is {r_up.stiffness_n_per_m / r.stiffness_n_per_m:.3f}× as stiff ({(r_up.stiffness_n_per_m / r.stiffness_n_per_m - 1) * 100:.0f} % more) "
+                f"and its root stress is {r_up.root_stress_pa / r.root_stress_pa:.3f}× ({(1 - r_up.root_stress_pa / r.root_stress_pa) * 100:.0f} % lower).")
+        if length / thick < 10:
+            st.warning(f"L/t = {length / thick:.1f} is below 10: this plate is short for its thickness, so beam theory ignores shear deflection and under-predicts the deflection.")
+        if r.deflection_m > 0.1 * length:
+            st.warning("The deflection is more than 10 % of the length: linear beam theory is not reliable for large deflections.")
+        ts = [0.001 + 0.019 * i / 80 for i in range(81)]
+        res = [cantilever_plate(load, length, width, x, e_pa) for x in ts]
+        xs = [float(units.from_si(x, "length", system)) for x in ts]
+        fig = make_subplots(rows=1, cols=2, subplot_titles=("Tip deflection", "Root bending stress"), horizontal_spacing=0.14)
+        x0 = float(units.from_si(thick, "length", system))
+        for col, name, ys, y0, color in ((1, "Tip deflection", [float(units.from_si(x.deflection_m, "length", system)) for x in res],
+                                          float(units.from_si(r.deflection_m, "length", system)), ACCENT),
+                                         (2, "Root stress", [float(units.from_si(x.root_stress_pa, "stress", system)) for x in res],
+                                          float(units.from_si(r.root_stress_pa, "stress", system)), COLOR_AMBER)):
+            fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name=name, line=dict(color=color, width=3), showlegend=False), row=1, col=col)
+            fig.add_trace(go.Scatter(x=[x0], y=[y0], mode="markers", name="This plate", showlegend=col == 1,
+                                     marker=dict(size=13, color=PASS_COLOR, line=dict(width=2, color="#222"))), row=1, col=col)
+        apply_theme(fig, "Deflection falls with t³, stress with t² (log scales)", 360)
+        fig.update_xaxes(title=f"Thickness ({units.label('length', system)})")
+        fig.update_yaxes(title=f"Tip deflection ({units.label('length', system)})", type="log", row=1, col=1)
+        fig.update_yaxes(title=f"Stress ({units.label('stress', system)})", type="log", row=1, col=2)
+        fig.update_layout(legend=dict(orientation="h", y=-0.28))
+        st.plotly_chart(fig, width="stretch")
+
+
 def _render_threads() -> None:
     st.caption("Thread standards are tabulated in their own units, so this tab shows mm for metric threads and inches for "
                "inch threads regardless of the units setting. Values are nominal and illustrative of the standard tables.")
@@ -274,11 +524,10 @@ def _render_threads() -> None:
 
 def render() -> None:
     system = get_unit_system()
-    tab_val, tab_thr = st.tabs(["Units & validation", "Threads & fasteners"])
-    with tab_val:
-        _render_validation(system)
-    with tab_thr:
-        _render_threads()
+    tabs = st.tabs(["Units & validation", "Threads & fasteners", "Pipe sizes", "Wall under pressure", "Thickness sensitivity"])
+    for tab, fn in zip(tabs, (_render_validation, lambda _s: _render_threads(), _render_pipes, _render_wall, _render_plate)):
+        with tab:
+            fn(system)
 
 
 if __name__ == "__main__":

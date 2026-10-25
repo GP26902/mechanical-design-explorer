@@ -117,9 +117,9 @@ def _run():
     return AppTest.from_file(str(ROOT / "chapters" / "basic_tools.py"), default_timeout=30).run()
 
 
-def test_chapter_loads_with_two_tabs_and_default_thread():
+def test_chapter_loads_with_its_tabs_and_default_thread():
     at = _run()
-    assert not at.exception and len(at.tabs) == 2
+    assert not at.exception and len(at.tabs) == 5
     labels = [m.label for m in at.metric]
     assert "Tensile stress area" in labels
     assert at.metric[labels.index("Tensile stress area")].value == "36.6 mm²"                    # M8 x 1.25 default
