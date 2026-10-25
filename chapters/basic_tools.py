@@ -2,7 +2,7 @@
 
 Tabs: units and validation demos; thread and fastener sizes (ISO metric and UNC/UNF); pipe sizes (ASME B36.10, schedule 40
 and 80); wall thickness under internal pressure (thin-wall and Lame thick-wall); thickness sensitivity of a cantilever
-plate. Calculations are pure functions (no Streamlit). Thread and pipe standards are tabulated in their own units, so
+plate; ISO 286 standard tolerance grades. Calculations are pure functions (no Streamlit). Thread and pipe standards are tabulated in their own units, so
 those dimensions are in mm (or inch for the inch threads), named accordingly; the other functions are SI in, SI out.
 """
 import sys
@@ -25,7 +25,8 @@ from common.validation import ValidationError, require_less_than, require_non_ne
 
 TITLE = "4 · Basic tools & examples"
 DESCRIPTION = ("Small calculators the other chapters rely on: unit and validation demos, ISO metric and UNC/UNF thread "
-               "sizes with clearance holes, pipe sizes, wall thickness under pressure and plate thickness sensitivity.")
+               "sizes with clearance holes, pipe sizes, wall thickness under pressure, plate thickness sensitivity and "
+               "ISO 286 tolerance grades.")
 ORDER = 90          # listed after chapters 1 to 3 (they use the default, 50)
 KEY_PREFIX = "bt_"
 ABOUT = """**Method.** Each tab is a small closed-form calculator or a lookup of published standard values, shown with the formula it uses.
@@ -38,11 +39,13 @@ ABOUT = """**Method.** Each tab is a small closed-form calculator or a lookup of
 
 **Thickness sensitivity.** Cantilever plate of width b, length L and thickness t with a tip load P: deflection δ = 4PL³/(Ebt³), stiffness k = P/δ = Ebt³/(4L³), root stress σ = 6PL/(bt²). Deflection falls with the cube of the thickness and stress with its square. Beam theory assumes a long plate (L/t of about 10 or more) and small deflections; the tab warns otherwise.
 
+**Tolerance grades.** ISO 286-1 standard tolerance grades IT5 to IT12 for nominal sizes up to 500 mm (the size range is "over a, up to and including b"). The tolerance width T is the table value; a hole H class is +T/0, a shaft h class is 0/−T and a js class is ±T/2. These are the values to enter in Chapter 3's stack-up table. The table follows T = k·i with the standard tolerance factor i = 0.45 ∛D + 0.001 D (µm, D the geometric mean of the size range) and k = 7, 10, 16, 25, 40, 64, 100, 160 for IT5 to IT12, rounded as the standard rounds them. Only the grades, not the fundamental deviations or fit classes (such as H7/g6), are included.
+
 **Units & validation.** The circle-area demo and two small cases (a hollow tube and a simply supported beam) show how impossible inputs get a clear message instead of a crash.
 
-**Checked in pytest:** the thread geometry formulas by hand; tensile stress areas against the published ISO 898-1 table (coarse and fine pitches) and the UN tables (UNC and UNF); the clearance-hole tables for consistency; T = H − F by hand; pipe inside diameters, flow area and velocity by hand; thin-wall and Lamé stresses and required walls by hand, including the round trip (a wall sized for S gives exactly S); cantilever deflection, stiffness and root stress by hand with the cube and square laws; every input check.
+**Checked in pytest:** the thread geometry formulas by hand; tensile stress areas against the published ISO 898-1 table (coarse and fine pitches) and the UN tables (UNC and UNF); the clearance-hole tables for consistency; T = H − F by hand; pipe inside diameters, flow area and velocity by hand; thin-wall and Lamé stresses and required walls by hand, including the round trip (a wall sized for S gives exactly S); cantilever deflection, stiffness and root stress by hand with the cube and square laws; the IT grade table against the published ISO 286-1 values, its size-range boundary rule and the T = k·i formula; every input check.
 
-**Limitations:** nominal dimensions only (no tolerance classes such as 6g/6H or manufacturing tolerances on pipe wall), no proof or tensile loads, and a limited list of sizes (M3 to M30, #4 to 1-1/4 in, NPS 1/2 to 8). Pipe dimensions are carbon-steel B36.10M values; stainless pipe (B36.19M) differs for some schedules and sizes. The wall-thickness tab ignores weld joint efficiency, temperature, external pressure, bends and the piping and pressure-vessel codes. The plate tab uses linear beam theory. Charts from other sources round some medium clearance holes differently (for example M12 and M16). Values are for learning and screening: confirm them against the standard before using them for real work.
+**Limitations:** nominal dimensions only (no tolerance classes such as 6g/6H or manufacturing tolerances on pipe wall), no proof or tensile loads, and a limited list of sizes (M3 to M30, #4 to 1-1/4 in, NPS 1/2 to 8, IT5 to IT12 up to 500 mm). Pipe dimensions are carbon-steel B36.10M values; stainless pipe (B36.19M) differs for some schedules and sizes. The wall-thickness tab ignores weld joint efficiency, temperature, external pressure, bends and the piping and pressure-vessel codes. The plate tab uses linear beam theory. Charts from other sources round some medium clearance holes differently (for example M12 and M16). Values are for learning and screening: confirm them against the standard before using them for real work.
 
 For learning and screening, not certified design."""
 
@@ -236,6 +239,42 @@ def cantilever_plate(load_n: float, length_m: float, width_m: float, thickness_m
         require_positive(v, n)
     delta = 4 * load_n * length_m**3 / (e_pa * width_m * thickness_m**3)
     return PlateResult(delta, load_n / delta, 6 * load_n * length_m / (width_m * thickness_m**2))
+
+
+# ISO 286-1 standard tolerance grades, micrometres. Size ranges are "over a, up to and including b" (mm).
+IT_RANGES = [(0, 3), (3, 6), (6, 10), (10, 18), (18, 30), (30, 50), (50, 80), (80, 120), (120, 180), (180, 250),
+             (250, 315), (315, 400), (400, 500)]
+IT_GRADES = (5, 6, 7, 8, 9, 10, 11, 12)
+IT_TABLE_UM = {
+    5: [4, 5, 6, 8, 9, 11, 13, 15, 18, 20, 23, 25, 27],
+    6: [6, 8, 9, 11, 13, 16, 19, 22, 25, 29, 32, 36, 40],
+    7: [10, 12, 15, 18, 21, 25, 30, 35, 40, 46, 52, 57, 63],
+    8: [14, 18, 22, 27, 33, 39, 46, 54, 63, 72, 81, 89, 97],
+    9: [25, 30, 36, 43, 52, 62, 74, 87, 100, 115, 130, 140, 155],
+    10: [40, 48, 58, 70, 84, 100, 120, 140, 160, 185, 210, 230, 250],
+    11: [60, 75, 90, 110, 130, 160, 190, 220, 250, 290, 320, 360, 400],
+    12: [100, 120, 150, 180, 210, 250, 300, 350, 400, 460, 520, 570, 630]}
+
+
+def it_range_index(size_mm: float) -> int:
+    """Index of the ISO 286 size range 'over a, up to and including b' that contains the size."""
+    require_positive(size_mm, "Nominal size")
+    if size_mm > IT_RANGES[-1][1]:
+        raise ValidationError(f"{size_mm:g} mm is above the 500 mm limit of this table.")
+    return next(i for i, (_, hi) in enumerate(IT_RANGES) if size_mm <= hi)
+
+
+def it_tolerance_um(size_mm: float, grade: int) -> float:
+    """ISO 286-1 standard tolerance (width of the tolerance zone) in micrometres."""
+    if grade not in IT_TABLE_UM:
+        raise ValidationError(f"IT{grade} is not in this table (IT5 to IT12).")
+    return float(IT_TABLE_UM[grade][it_range_index(size_mm)])
+
+
+def it_zone_entries_um(size_mm: float, grade: int) -> dict:
+    """(upper, lower) deviations in micrometres for hole H, shaft h and symmetric js zones of the same grade."""
+    t = it_tolerance_um(size_mm, grade)
+    return {"Hole, H": (t, 0.0), "Shaft, h": (0.0, -t), "Symmetric, js": (t / 2, -t / 2)}
 
 
 def coarse_series_rows() -> list:
@@ -515,6 +554,52 @@ def _render_plate(system: str) -> None:
         st.plotly_chart(fig, width="stretch")
 
 
+def _render_grades(system: str) -> None:
+    st.caption("ISO 286-1 standard tolerance grades (the width of the tolerance zone). Enter these in Chapter 3's stack-up table. "
+               "Example inputs are illustrative.")
+    left, right = st.columns([1, 2], gap="large")
+    with left:
+        size = _slider("Nominal size", "length", 0.001, 0.500, 0.025, "bt_it_size", system)
+        grade = st.selectbox("Tolerance grade", list(IT_GRADES), index=IT_GRADES.index(7), format_func=lambda g: f"IT{g}", key="bt_it_grade")
+        st.caption("Smaller grade numbers are tighter. IT5 to IT7 are typical for fits and bearings, IT11 and IT12 for loose general work.")
+    with right:
+        try:
+            size_mm = size * 1e3                                    # the slider returns SI (metres); the ISO table is in mm
+            t = it_tolerance_um(size_mm, grade)
+            entries = it_zone_entries_um(size_mm, grade)
+            lo, hi = IT_RANGES[it_range_index(size_mm)]
+        except ValidationError as exc:
+            _show_error(exc)
+            return
+        a, b = st.columns(2)
+        a.metric(f"IT{grade} tolerance T", f"{t:g} µm" if system == units.SI else f"{t / 25.4:.2f} mil (0.001 in)")
+        b.metric("Size range used", f"over {lo:g} to {hi:g} mm" if system == units.SI else f"over {lo / 25.4:.3f} to {hi / 25.4:.3f} in")
+        if system == units.SI:
+            fmt_dev = lambda v: f"{v:+g}".replace("+0", "0") if v else "0"
+            unit = "µm"
+        else:
+            fmt_dev = lambda v: f"{v / 25.4:+.2f}" if v else "0"
+            unit = "mil"
+        rows = [{"Zone": k, f"Upper deviation ({unit})": fmt_dev(u), f"Lower deviation ({unit})": fmt_dev(l),
+                 "Size limits": f"{units.fmt(size + u * 1e-6, 'length', system, 5)} / {units.fmt(size + l * 1e-6, 'length', system, 5)}"}
+                for k, (u, l) in entries.items()]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        st.caption(f"Table values follow T = k·i with i = 0.45 ∛D + 0.001 D (µm) and k = {dict(zip(IT_GRADES, (7, 10, 16, 25, 40, 64, 100, 160)))[grade]} for IT{grade}, "
+                   "rounded as the standard rounds them.")
+        fig = go.Figure()
+        mids = [math.sqrt(max(a_, 1.0) * b_) for a_, b_ in IT_RANGES]
+        for g in IT_GRADES:
+            fig.add_trace(go.Scatter(x=mids, y=IT_TABLE_UM[g], mode="lines+markers", name=f"IT{g}",
+                                     line=dict(width=4 if g == grade else 1.5, color=ACCENT if g == grade else None),
+                                     marker=dict(size=5)))
+        fig.add_trace(go.Scatter(x=[size * 1e3], y=[t], mode="markers", name="This size", marker=dict(size=14, color=COLOR_AMBER,
+                                                                                                         line=dict(width=2, color="#222"))))
+        apply_theme(fig, "Standard tolerance against nominal size (log scales)", 360)
+        fig.update_xaxes(title="Nominal size (mm)", type="log")
+        fig.update_yaxes(title="Tolerance (µm)", type="log")
+        st.plotly_chart(fig, width="stretch")
+
+
 def _render_threads() -> None:
     st.caption("Thread standards are tabulated in their own units, so this tab shows mm for metric threads and inches for "
                "inch threads regardless of the units setting. Values are nominal and illustrative of the standard tables.")
@@ -524,8 +609,10 @@ def _render_threads() -> None:
 
 def render() -> None:
     system = get_unit_system()
-    tabs = st.tabs(["Units & validation", "Threads & fasteners", "Pipe sizes", "Wall under pressure", "Thickness sensitivity"])
-    for tab, fn in zip(tabs, (_render_validation, lambda _s: _render_threads(), _render_pipes, _render_wall, _render_plate)):
+    tabs = st.tabs(["Units & validation", "Threads & fasteners", "Pipe sizes", "Wall under pressure", "Thickness sensitivity",
+                    "Tolerance grades"])
+    for tab, fn in zip(tabs, (_render_validation, lambda _s: _render_threads(), _render_pipes, _render_wall, _render_plate,
+                              _render_grades)):
         with tab:
             fn(system)
 

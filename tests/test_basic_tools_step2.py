@@ -129,7 +129,7 @@ def _val(at, label):
 
 def test_five_tabs_and_pipe_tab_values():
     at = _run()
-    assert not at.exception and len(at.tabs) == 5
+    assert not at.exception and len(at.tabs) == 6
     assert _val(at, "Inside diameter") == "52.48 mm" and _val(at, "Outside diameter") == "60.3 mm" and _val(at, "Wall thickness") == "3.91 mm"
     assert _val(at, "Mean velocity at that flow") == "4.62 m/s"                                      # 10 L/s default
     at.radio(key="bt_sch").set_value(80).run()

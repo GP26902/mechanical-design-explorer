@@ -119,7 +119,7 @@ def _run():
 
 def test_chapter_loads_with_its_tabs_and_default_thread():
     at = _run()
-    assert not at.exception and len(at.tabs) == 5
+    assert not at.exception and len(at.tabs) == 6
     labels = [m.label for m in at.metric]
     assert "Tensile stress area" in labels
     assert at.metric[labels.index("Tensile stress area")].value == "36.6 mm²"                    # M8 x 1.25 default

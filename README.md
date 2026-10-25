@@ -1,6 +1,6 @@
 # Mechanical Design Explorer
 
-Interactive engineering tools for the questions mechanical, quality and manufacturing engineers ask every day: **will this beam or shaft survive, will these parts assemble and which tolerance should be tightened, and where does a pump and pipe system lose pressure or cavitate.**
+Interactive engineering tools for the questions mechanical, quality and manufacturing engineers ask every day: **will this beam or shaft survive, will these parts assemble and which tolerance should be tightened, and where does a pump and pipe system lose pressure or cavitate.** A fourth chapter collects the small calculators these tools rely on: thread, pipe and tolerance-grade tables, wall thickness under pressure and plate stiffness.
 
 **[Open the live app](https://mechanical-design-explorer-dt92wtfsjydzt3htt2zmkg.streamlit.app/)** · Built with Python, NumPy, Pandas, Plotly and Streamlit · Free hosting, so the first load may take a few seconds.
 
@@ -8,7 +8,7 @@ Interactive engineering tools for the questions mechanical, quality and manufact
 
 ## What it does
 
-All three chapters share a sidebar with a chapter dropdown, SI or US units, a **Reset to defaults** button and an **About this chapter** box that states the method, the checks and the limitations. Dimension sliders have an exact-entry box beside them, and impossible inputs (zero diameter, negative span and so on) give a clear message instead of a crash.
+All chapters share a sidebar with a chapter dropdown, SI or US units, a **Reset to defaults** button and an **About this chapter** box that states the method, the checks and the limitations. Dimension sliders have an exact-entry box beside them, and impossible inputs (zero diameter, negative span and so on) give a clear message instead of a crash.
 
 ### 1. Beam, shaft & column stress
 *Question: does this part carry the load with enough margin?*
@@ -51,18 +51,34 @@ All three chapters share a sidebar with a chapter dropdown, SI or US units, a **
 ![Gap histogram with spec limits and Cpk](docs/tolerance-histogram.png)
 ![Position tolerance zone with bonus tolerance](docs/gdt-position-zone.png)
 
+### 4. Basic tools & examples
+*Question: what are the standard sizes and the quick checks I need while using the other three chapters?*
+
+- **Units & validation:** a diameter demo and two small cases (a round tube and a simply supported beam) showing the clear message every chapter gives for an impossible input.
+- **Threads & fasteners:** ISO metric (M3 to M30, coarse and common fine pitches) and UNC/UNF (#4 to 1-1/4 in) thread geometry and **tensile stress area**, an approximate tap drill, ISO 273 close and normal **clearance holes**, and the **floating-fastener position tolerance T = H − F** used in Chapter 3.
+- **Pipe sizes:** NPS 1/2 to 8, schedule 40 and 80 (ASME B36.10M): outside and inside diameter, wall, flow area and the mean velocity at a flow. The inside diameter is the pipe diameter to use in Chapter 2.
+- **Wall under pressure:** thin-wall and thick-wall (Lamé) hoop and axial stress for internal pressure, the required wall for an allowable stress with a corrosion allowance, and a pass or fail. A stress screening of a plain cylinder, **not a pressure-vessel or piping code design**.
+- **Thickness sensitivity:** a tip-loaded cantilever plate showing that deflection falls with the cube of the thickness and stress with its square, with warnings for short plates and large deflections.
+- **Tolerance grades:** ISO 286-1 standard tolerance grades IT5 to IT12 by nominal size, with the hole H, shaft h and symmetric js zones to enter in Chapter 3's stack-up table.
+- The chapter is listed last in the dropdown by a small `ORDER` setting (see "Add a chapter").
+
+![Thread stress area by size](docs/basic-tools-threads.png)
+![Hoop stress against wall thickness, thin-wall and Lamé](docs/basic-tools-wall-stress.png)
+![ISO 286 standard tolerance grades against nominal size](docs/basic-tools-it-grades.png)
+
 *The images are screenshots of the app's own charts with illustrative inputs.*
 
 ## How the results are checked
 
-568 automated tests (`python -m pytest`) cover the calculations, the input validation and the app itself. Calculations are pure functions with no Streamlit dependency, so they are tested directly against textbook formulas and hand calculations.
+700 automated tests (`python -m pytest`) cover the calculations, the input validation and the app itself. Calculations are pure functions with no Streamlit dependency, so they are tested directly against textbook formulas and hand calculations.
 
 | Area | Tests | What is checked |
 |---|---|---|
 | Beam, shaft & column | 194 + 5 app | Reactions, shear and moment for point and uniform loads (PL/4, wL²/8); deflection against PL³/48EI, PL³/3EI, 5wL⁴/384EI and wL⁴/8EI; fixed-fixed end moments (Pab²/L², wL²/12), propped cantilever and overhanging beam reactions; force and moment equilibrium for every support and load case; the small 1D finite-element model against the closed form; section properties for five cross-sections; torsion τ = Tc/J; von Mises; endurance limit, Goodman and the Kt factor; custom material and deflection-limit checks; Euler load π²EI/(KL)² for four end conditions and the Johnson curve joining Euler at the slenderness limit; invalid loads and sections; figures build |
 | Tolerance stack-up & GD&T | 131 + 15 app | Worst-case, RSS (√Σt²) and Cpk against hand values for a worked stack; the normal, uniform and triangular variances; mean shift; Cp, ppm and sigma level; the budget scale factor and its round trip; asymmetric tolerances; contribution shares; Monte Carlo against the analytic mean, σ and tail fraction (fixed seed); example stacks and CSV contents; bonus tolerance, zone and virtual condition at MMC, LMC and RFS; the fastener formulas; boundary and out-of-size cases; invalid rows, spec limits and sample counts |
 | Pump & pipe | 137 + 19 app | Laminar f = 64/Re; Colebrook against the Moody chart and Swamee-Jain; Darcy-Weisbach and minor-loss hand values; an independent hand calculation of the system head; affinity laws; analytic operating point; NPSH available and cavitation thresholds; water vapour pressure; energy balance along the layout; hydraulic, shaft and electrical power and yearly cost by hand; the drive speed against its closed form and the operating-point solver; the throttle loss against an equivalent valve added to the layout; the pump-curve fit against a hand regression and numpy; parallel and series curves and operating points against closed forms; standard-atmosphere values and tank-pressure static head by hand; a custom fluid with water's own properties against the water result; density scaling; example systems; CSV contents and unit conversion; weak pump (no operating point); invalid layouts, pumps, fluids and inputs |
-| Shared code | 67 | Unit conversions and round trips (26), slider stepping (15), validation helpers (11), sidebar and sliders (6), chapter auto-discovery (5), app smoke tests (4) |
+| Basic tools & examples | 131 (7 app) | Thread geometry by hand; tensile stress areas against the published ISO 898-1 table (20 coarse and fine sizes) and the UNC/UNF tables; clearance-hole tables for consistency; T = H − F; pipe bores, flow area and velocity; thin-wall and Lamé stresses with force-balance checks, required walls and the round trip; cantilever plate deflection and stress against PL³/3EI and Mc/I with the cube and square laws; the ISO 286-1 tolerance grade table, its size-range boundary rule and the T = k·i formula; every invalid input |
+| Shared code | 68 | Unit conversions and round trips (26), slider stepping (15), validation helpers (11), sidebar and sliders (6), chapter auto-discovery and ordering (6), app smoke tests (4) |
 
 ## Limitations
 
@@ -70,6 +86,7 @@ All three chapters share a sidebar with a chapter dropdown, SI or US units, a **
 - **Pump & pipe:** one series path with one pipe material. Loss coefficients are rounded textbook values and real fittings vary. The pump curve is quadratic; the NPSH-required shape, the pump efficiency curve and the constant motor and drive efficiencies are assumptions, not manufacturer data. The pump curve is not corrected for fluid viscosity, so results for viscous liquids are indicative only, and a custom fluid's properties do not change with temperature. Pump pairs are identical, run at the same speed and are always both running; interaction between pumps and check-valve losses are ignored. Pipe elevation changes in the colour map, water hammer, two-phase flow and parallel branches are not modelled. Flow between Re 2300 and 4000 is flagged as transitional and its friction factor is only a guide.
 - **Tolerance stack-up:** one-dimensional linear stacks with no correlation between dimensions. Each tolerance band follows the chosen distribution (normal bands are ±kσ with k selectable, default 3), and Monte Carlo samples are not truncated at the limits. Cpk and ppm from RSS assume the summed gap is roughly normal. Process drift, 2D or 3D stacks and non-normal gap shapes beyond the three row distributions are not modelled.
 - **GD&T:** a single feature of size with one position zone at MMC, LMC or RFS. Datum reference frames and datum shift, composite or projected tolerance zones, and orientation and form controls are not modelled. The fixed-fastener formula assumes the fixed fastener's perpendicularity is controlled.
+- **Basic tools & examples:** nominal dimensions and tabulated values only. Thread sizes are limited to M3 to M30 and #4 to 1-1/4 in with no tolerance classes or proof loads. Pipe sizes are NPS 1/2 to 8 carbon-steel B36.10M values. Some published charts round medium clearance holes differently (for example M12 and M16). The wall-thickness tab ignores weld joint efficiency, temperature, external pressure and the piping and pressure-vessel codes. The plate tab uses linear beam theory. Tolerance grades are IT5 to IT12 up to 500 mm, without fundamental deviations or fit classes. Table values are for learning and screening: confirm them against the standard for real work.
 
 ## Run it locally
 
@@ -85,7 +102,7 @@ python -m pytest                    # the test suite
 `app.py` finds every file in `chapters/` automatically, so a new chapter needs **no edits to `app.py`**.
 
 1. Copy `chapters/_template.py` to `chapters/<your_chapter>.py` (no leading underscore).
-2. Set `TITLE` and `DESCRIPTION`, put the calculations in pure functions (SI in, SI out, no Streamlit) at the top of the file, and write the interface in `render()`.
+2. Set `TITLE` and `DESCRIPTION` (optionally `KEY_PREFIX`, `ABOUT` and `ORDER`: chapters are listed by `ORDER`, default 50, then by filename), put the calculations in pure functions (SI in, SI out, no Streamlit) at the top of the file, and write the interface in `render()`.
 3. Import only from `common/` and never from another chapter. Raise `ValidationError` (from `common/validation.py`) for impossible inputs.
 4. Run it alone with `streamlit run chapters/<your_chapter>.py`, add tests that import it with `from chapters import <your_chapter>`, then reload the app: it appears in the chapter dropdown.
 
@@ -93,7 +110,7 @@ python -m pytest                    # the test suite
 
 ```
 app.py              base shell: chapter dropdown, units, disclaimer
-chapters/           one file per chapter (beam_shaft, tolerance_stack, pump_pipe), plus _template.py and a small example
+chapters/           one file per chapter (beam_shaft, pump_pipe, tolerance_stack, basic_tools), plus _template.py
 common/             units (SI and US), validation, plot theme, shared UI helpers, chapter discovery
 tests/              pytest and Streamlit AppTest suites
 docs/               chart images used in this README
